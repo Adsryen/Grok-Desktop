@@ -10,6 +10,19 @@
     <title>Grok Desktop</title>
     <link rel="icon" type="image/png" href="./favicon.png" />
     <link rel="stylesheet" href="./styles.css" />
+    <!-- 启动前按系统外观上色，避免深色偏好时先闪浅色；正式偏好由 settings.theme 覆盖 -->
+    <script>
+      (function () {
+        try {
+          var dark =
+            window.matchMedia &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var t = dark ? "dark" : "light";
+          document.documentElement.dataset.theme = t;
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <!-- Codex Desktop 对齐：浅色 · 左导航 · 中对话/可拖拽侧栏 -->

@@ -13,6 +13,8 @@ type Inv = <T>(method: HostIpcMethod, params?: unknown) => Promise<{
 export type SettingsPermMode = "always_approve" | "normal" | "plan";
 /** explorer | code | cursor | codium | windsurf | editor(遗留) */
 export type SettingsOpenTarget = string;
+/** Appearance: follow OS or force light/dark */
+export type SettingsThemePreference = "system" | "light" | "dark";
 
 export interface DesktopConfigData {
   defaultModel?: string;
@@ -22,6 +24,8 @@ export interface DesktopConfigData {
   defaultOpenTarget?: SettingsOpenTarget;
   /** UI language preference */
   locale?: LocalePreference;
+  /** Appearance preference */
+  theme?: SettingsThemePreference;
   paths?: {
     settings: string;
     configToml: string;
@@ -38,6 +42,7 @@ export interface SettingsPageCallbacks {
     defaultModel: string;
     defaultOpenTarget: SettingsOpenTarget;
     locale?: LocalePreference;
+    theme?: SettingsThemePreference;
   }) => void;
   /** 关闭设置页后（恢复主界面交互 / 焦点） */
   onClosed?: () => void;
@@ -251,11 +256,13 @@ export class SettingsPageController {
     const model = (this.cfg.defaultModel ?? "").trim() || "grok";
     const openTarget = this.cfg.defaultOpenTarget ?? "explorer";
     const locale = this.cfg.locale ?? "system";
+    const theme = this.cfg.theme ?? "system";
     this.cb.onConfigApplied({
       defaultPermMode: mode,
       defaultModel: model,
       defaultOpenTarget: openTarget,
       locale,
+      theme,
     });
   }
 
@@ -346,6 +353,7 @@ export class SettingsPageController {
     const mode = this.cfg.defaultPermMode ?? "normal";
     const openTarget = this.cfg.defaultOpenTarget ?? "explorer";
     const locale = (this.cfg.locale ?? "system") as LocalePreference;
+    const theme = (this.cfg.theme ?? "system") as SettingsThemePreference;
     const edRes = await this.cb.inv<{
       editors: Array<{ id: string; label: string; command: string }>;
     }>("system.listEditors");
@@ -389,6 +397,24 @@ export class SettingsPageController {
               <option value="system" ${locale === "system" ? "selected" : ""}>${this.cb.esc(tr("settings.language.system"))}</option>
               <option value="zh-CN" ${locale === "zh-CN" ? "selected" : ""}>${this.cb.esc(tr("settings.language.zh"))}</option>
               <option value="en-US" ${locale === "en-US" ? "selected" : ""}>${this.cb.esc(tr("settings.language.en"))}</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      <section class="settings-block">
+        <h2 class="settings-h2">${this.cb.esc(tr("settings.theme"))}</h2>
+        <p class="settings-desc">${this.cb.esc(tr("settings.themeSub"))}</p>
+        <div class="settings-card">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">${this.cb.esc(tr("settings.theme"))}</div>
+              <div class="settings-row-sub">${this.cb.esc(tr("settings.themeSub"))}</div>
+            </div>
+            <select id="cfg-theme" class="settings-select">
+              <option value="system" ${theme === "system" ? "selected" : ""}>${this.cb.esc(tr("settings.theme.system"))}</option>
+              <option value="light" ${theme === "light" ? "selected" : ""}>${this.cb.esc(tr("settings.theme.light"))}</option>
+              <option value="dark" ${theme === "dark" ? "selected" : ""}>${this.cb.esc(tr("settings.theme.dark"))}</option>
             </select>
           </div>
         </div>
@@ -459,6 +485,11 @@ export class SettingsPageController {
         this.renderNav();
         void this.renderContent();
       });
+    });
+    const themeSel = root.querySelector("#cfg-theme") as HTMLSelectElement | null;
+    themeSel?.addEventListener("change", () => {
+      const value = themeSel.value as SettingsThemePreference;
+      void this.patch({ theme: value });
     });
   }
 

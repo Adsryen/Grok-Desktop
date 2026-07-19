@@ -200,7 +200,7 @@ export const enUS: MessageDict = {
   "settings.section.memory": "Memory",
   "settings.section.shortcuts": "Keyboard shortcuts",
   "settings.kw.general":
-    "permission open default full access plan language locale",
+    "permission open default full access plan language locale theme appearance dark light",
   "settings.kw.account":
     "login oauth official proxy provider api key base_url auth account",
   "settings.kw.about": "version diagnostics",
@@ -213,6 +213,12 @@ export const enUS: MessageDict = {
   "settings.language.system": "System default",
   "settings.language.zh": "简体中文",
   "settings.language.en": "English",
+  "settings.theme": "Appearance",
+  "settings.themeSub":
+    "Light, dark, or match the system; applies immediately",
+  "settings.theme.system": "System default",
+  "settings.theme.light": "Light",
+  "settings.theme.dark": "Dark",
   "settings.navAria": "Settings sections",
   "app.title": "Grok Desktop",
 

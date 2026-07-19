@@ -194,7 +194,7 @@ export const zhCN = {
   "settings.section.about": "关于",
   "settings.section.memory": "记忆",
   "settings.section.shortcuts": "键盘快捷键",
-  "settings.kw.general": "权限 打开 默认 完全访问 plan language 语言",
+  "settings.kw.general": "权限 打开 默认 完全访问 plan language 语言 theme 主题 暗色 深色 浅色 外观",
   "settings.kw.account":
     "登录 oauth 官方 中转 提供商 api key base_url 鉴权 账户",
   "settings.kw.about": "版本 诊断",
@@ -206,6 +206,11 @@ export const zhCN = {
   "settings.language.system": "跟随系统",
   "settings.language.zh": "简体中文",
   "settings.language.en": "English",
+  "settings.theme": "外观",
+  "settings.themeSub": "浅色 / 深色，或跟随系统；切换后立即生效",
+  "settings.theme.system": "跟随系统",
+  "settings.theme.light": "浅色",
+  "settings.theme.dark": "深色",
   "settings.navAria": "设置分类",
   "app.title": "Grok Desktop",
 

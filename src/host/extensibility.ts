@@ -251,6 +251,9 @@ export type DesktopPermMode = "always_approve" | "normal" | "plan";
 /** explorer | code | cursor | codium | windsurf | editor(遗留) */
 export type DesktopOpenTarget = string;
 
+/** UI color theme; `system` follows OS / Chromium prefers-color-scheme. */
+export type DesktopThemePreference = "system" | "light" | "dark";
+
 export interface DesktopConfig {
   defaultModel?: string;
   grokPathOverride?: string;
@@ -265,6 +268,11 @@ export interface DesktopConfig {
    * `system` follows OS / Chromium locale; otherwise `zh-CN` | `en-US`.
    */
   locale?: "zh-CN" | "en-US" | "system";
+  /**
+   * Appearance: light / dark / follow system.
+   * Default when unset: `system`.
+   */
+  theme?: DesktopThemePreference;
   /**
    * 跨会话 Memory（实验）：对齐 CLI `--experimental-memory` / `GROK_MEMORY`。
    * 真存储在 GROK_HOME/memory/，非 desktop/memory/entries.json。

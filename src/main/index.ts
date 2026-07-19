@@ -12,6 +12,7 @@ import {
   dialog,
   shell,
   clipboard,
+  nativeTheme,
 } from "electron";
 import fs from "node:fs";
 import path from "node:path";
@@ -21,6 +22,84 @@ import { resolveAgentBinPath } from "../host/agent-bin.js";
 import { HOST_EVENT_CHANNEL, HOST_IPC_CHANNEL } from "../shared/host-api.js";
 import type { HostIpcMethod } from "../shared/host-api.js";
 import { HostError, isHostError } from "../shared/errors.js";
+import { readDesktopConfig } from "../host/extensibility.js";
+
+type ChromeTheme = "light" | "dark";
+
+const CHROME = {
+  light: { bg: "#f5f5f5", symbol: "#1a1a1a" },
+  dark: { bg: "#121212", symbol: "#e8e8e8" },
+} as const;
+
+/**
+ * Dev parallel profile from env or CLI:
+ *   GROK_DESKTOP_PROFILE=dev
+ *   electron . -- --profile=dev
+ * Isolates Host lock (~/.grok-desktop-dev) + Electron userData from the installed app.
+ */
+function resolveProfileName(): string {
+  const fromEnv = (process.env.GROK_DESKTOP_PROFILE ?? "").trim();
+  if (fromEnv) return fromEnv.toLowerCase();
+  const eq = process.argv.find((a) => a.startsWith("--profile="));
+  if (eq) return eq.slice("--profile=".length).trim().toLowerCase();
+  const idx = process.argv.indexOf("--profile");
+  if (idx >= 0 && process.argv[idx + 1]) {
+    return process.argv[idx + 1].trim().toLowerCase();
+  }
+  return "";
+}
+
+const PROFILE_NAME = (() => {
+  const raw = resolveProfileName();
+  if (!raw || raw === "default" || raw === "prod") return "";
+  process.env.GROK_DESKTOP_PROFILE = raw;
+  return raw;
+})();
+
+function isDevProfile(): boolean {
+  return Boolean(PROFILE_NAME);
+}
+
+/** Must run before app.ready — separate Chromium profile from installed build. */
+if (isDevProfile() && !app.isReady()) {
+  try {
+    const ud = path.join(app.getPath("home"), ".grok-desktop-profiles", PROFILE_NAME, "electron");
+    app.setPath("userData", ud);
+  } catch {
+    /* ignore */
+  }
+}
+
+function resolveStartupChromeTheme(): ChromeTheme {
+  try {
+    // readDesktopConfig uses grokHomeDir → respects GROK_DESKTOP_PROFILE
+    const pref = readDesktopConfig().theme ?? "system";
+    if (pref === "light" || pref === "dark") return pref;
+  } catch {
+    /* ignore */
+  }
+  return nativeTheme.shouldUseDarkColors ? "dark" : "light";
+}
+
+function applyWindowChrome(win: BrowserWindow, theme: ChromeTheme): void {
+  const c = CHROME[theme];
+  try {
+    win.setBackgroundColor(c.bg);
+  } catch {
+    /* ignore */
+  }
+  if (process.platform === "win32") {
+    try {
+      win.setTitleBarOverlay({
+        color: c.bg,
+        symbolColor: c.symbol,
+        height: 36,
+      });
+    } catch {
+      /* ignore older Electron */
+    }
+  }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 应用根（dist/main → ../.. = 项目根） */
@@ -259,6 +338,14 @@ async function handleHostIpc(
       return resultOk(host.configGet());
     case "config.patch":
       return resultOk(host.configPatch(p));
+    case "ui.setChromeTheme": {
+      const theme = p.theme === "dark" ? "dark" : "light";
+      const win = windowAlive()
+        ? mainWindow!
+        : BrowserWindow.getFocusedWindow();
+      if (win && !win.isDestroyed()) applyWindowChrome(win, theme);
+      return resultOk({ theme });
+    }
     case "projects.list":
       return resultOk(host.projectsList(Boolean(p.includeArchived)));
     case "projects.add":
@@ -730,13 +817,15 @@ async function createWindow(): Promise<void> {
   const preloadPath = path.join(__dirname, "preload.cjs");
   const appIcon = loadAppIcon();
   // Windows：隐藏标题栏图标+文字，保留顶部占位与系统按钮（布局不挤进客户区）
+  const chromeTheme = resolveStartupChromeTheme();
+  const chrome = CHROME[chromeTheme];
   const winTitleBar =
     process.platform === "win32"
       ? {
           titleBarStyle: "hidden" as const,
           titleBarOverlay: {
-            color: "#f5f5f5",
-            symbolColor: "#1a1a1a",
+            color: chrome.bg,
+            symbolColor: chrome.symbol,
             height: 36,
           },
         }
@@ -746,8 +835,8 @@ async function createWindow(): Promise<void> {
     height: 900,
     minWidth: 720,
     minHeight: 480,
-    title: "Grok Desktop",
-    backgroundColor: "#f5f5f5",
+    title: isDevProfile() ? `Grok Desktop [dev:${PROFILE_NAME}]` : "Grok Desktop",
+    backgroundColor: chrome.bg,
     ...(appIcon ? { icon: appIcon } : {}),
     ...winTitleBar,
     // 对齐 Codex：无原生 File/Edit/View 菜单栏
@@ -921,6 +1010,11 @@ function createTray(): void {
 }
 
 app.whenReady().then(async () => {
+  if (isDevProfile()) {
+    console.log(
+      `[grok-desktop] profile=${PROFILE_NAME} (parallel dev; installed app can stay open)`,
+    );
+  }
   const agentPaths = resolveDesktopAgentPaths();
   host = new DesktopHost({
     bundledPath: agentPaths.bundledPath,
@@ -943,7 +1037,9 @@ app.whenReady().then(async () => {
       ) ?? "grok://focus";
     await host.shellNotifyPrimary(deep);
     console.log(
-      "Grok Desktop already running; handoff sent, exiting secondary",
+      isDevProfile()
+        ? `Grok Desktop profile "${PROFILE_NAME}" already running; handoff sent, exiting secondary`
+        : "Grok Desktop already running; handoff sent, exiting secondary",
     );
     app.quit();
     return;

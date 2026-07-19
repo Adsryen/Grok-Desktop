@@ -4,13 +4,26 @@ import path from "node:path";
 import { ensureVendorCompatDisabled } from "./compat.js";
 
 /**
- * Desktop 专用 GROK_HOME：`~/.grok-desktop`
+ * Desktop 专用 GROK_HOME 目录名。
+ * - 默认：`~/.grok-desktop`
+ * - 开发并行实例：`GROK_DESKTOP_PROFILE=dev` → `~/.grok-desktop-dev`
+ *   （独立 lock / settings / sessions，可与安装版并存）
+ */
+export function grokProfileDirName(): string {
+  const raw = (process.env.GROK_DESKTOP_PROFILE ?? "").trim().toLowerCase();
+  if (!raw || raw === "default" || raw === "prod") return ".grok-desktop";
+  const safe = raw.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return safe ? `.grok-desktop-${safe}` : ".grok-desktop";
+}
+
+/**
+ * Desktop 专用 GROK_HOME：`~/.grok-desktop`（或 `GROK_DESKTOP_PROFILE` 派生目录）
  * 与 CLI 默认 `~/.grok` 隔离（auth / sessions / config / skills 等互不覆盖）。
  *
  * @param home OS 用户主目录（测试可传入临时目录）
  */
 export function grokHomeDir(home = os.homedir()): string {
-  return path.join(home, ".grok-desktop");
+  return path.join(home, grokProfileDirName());
 }
 
 /** CLI 默认 home：`~/.grok`（仅用于定位系统安装的 grok 二进制等，Desktop 不写入） */

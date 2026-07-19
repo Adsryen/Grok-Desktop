@@ -1121,7 +1121,7 @@ export class SidePaneController {
       const note = document.createElement("div");
       note.className = "side-pane-info";
       note.style.cssText =
-        "position:absolute;bottom:0;left:0;right:0;padding:6px 12px;background:#fff8e6;font-size:12px;border-top:1px solid #f0e0b0";
+        "position:absolute;bottom:0;left:0;right:0;padding:6px 12px;background:var(--orange-soft);color:var(--text);font-size:12px;border-top:1px solid var(--border)";
       note.textContent = tr("side.truncatedNote");
       $("side-pane-body").appendChild(note);
       setTimeout(() => note.remove(), 4000);

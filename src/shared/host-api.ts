@@ -34,6 +34,8 @@ export type HostIpcMethod =
   | "singleInstance.status"
   | "config.get"
   | "config.patch"
+  /** Shell chrome (title bar / window bg) — light | dark resolved theme */
+  | "ui.setChromeTheme"
   // projects
   | "projects.list"
   | "projects.add"
