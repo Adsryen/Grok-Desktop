@@ -12,12 +12,14 @@ import {
   dialog,
   shell,
   clipboard,
+  nativeTheme,
 } from "electron";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DesktopHost } from "../host/host.js";
 import { resolveAgentBinPath } from "../host/agent-bin.js";
+import { readDesktopConfig } from "../host/extensibility.js";
 import { HOST_EVENT_CHANNEL, HOST_IPC_CHANNEL } from "../shared/host-api.js";
 import type { HostIpcMethod } from "../shared/host-api.js";
 import { HostError, isHostError } from "../shared/errors.js";
@@ -25,6 +27,52 @@ import { HostError, isHostError } from "../shared/errors.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 应用根（dist/main → ../.. = 项目根） */
 const APP_ROOT = path.resolve(__dirname, "../..");
+
+type ChromeTheme = "light" | "dark";
+
+const CHROME = {
+  light: { bg: "#f5f5f5", symbol: "#1a1a1a" },
+  dark: { bg: "#121212", symbol: "#e8e8e8" },
+} as const;
+
+/** 启动时解析窗口 chrome（settings.theme + OS） */
+function resolveStartupChromeTheme(): ChromeTheme {
+  try {
+    const pref = readDesktopConfig().theme ?? "system";
+    if (pref === "light" || pref === "dark") return pref;
+  } catch {
+    /* ignore */
+  }
+  return nativeTheme.shouldUseDarkColors ? "dark" : "light";
+}
+
+function applyNativeThemeSource(pref: "system" | "light" | "dark"): void {
+  try {
+    nativeTheme.themeSource = pref;
+  } catch {
+    /* ignore */
+  }
+}
+
+function applyWindowChrome(win: BrowserWindow, theme: ChromeTheme): void {
+  const c = CHROME[theme];
+  try {
+    win.setBackgroundColor(c.bg);
+  } catch {
+    /* ignore */
+  }
+  if (process.platform === "win32") {
+    try {
+      win.setTitleBarOverlay({
+        color: c.bg,
+        symbolColor: c.symbol,
+        height: 36,
+      });
+    } catch {
+      /* older Electron */
+    }
+  }
+}
 
 function resolveDesktopAgentPaths(): {
   bundledPath: string | null;
@@ -257,8 +305,35 @@ async function handleHostIpc(
       return resultOk(host.singleInstanceStatus());
     case "config.get":
       return resultOk(host.configGet());
-    case "config.patch":
-      return resultOk(host.configPatch(p));
+    case "config.patch": {
+      const view = host.configPatch(p);
+      if (p.theme !== undefined) {
+        const pref =
+          p.theme === "light" || p.theme === "dark" || p.theme === "system"
+            ? p.theme
+            : "system";
+        applyNativeThemeSource(pref);
+        const chrome: ChromeTheme =
+          pref === "system"
+            ? nativeTheme.shouldUseDarkColors
+              ? "dark"
+              : "light"
+            : pref;
+        const win = windowAlive()
+          ? mainWindow!
+          : BrowserWindow.getFocusedWindow();
+        if (win && !win.isDestroyed()) applyWindowChrome(win, chrome);
+      }
+      return resultOk(view);
+    }
+    case "ui.setChromeTheme": {
+      const theme = p.theme === "dark" ? "dark" : "light";
+      const win = windowAlive()
+        ? mainWindow!
+        : BrowserWindow.getFocusedWindow();
+      if (win && !win.isDestroyed()) applyWindowChrome(win, theme);
+      return resultOk({ theme });
+    }
     case "projects.list":
       return resultOk(host.projectsList(Boolean(p.includeArchived)));
     case "projects.add":
@@ -741,14 +816,25 @@ async function createWindow(): Promise<void> {
   // package.json "type":"module" and leaves window.grokDesktop undefined.
   const preloadPath = path.join(__dirname, "preload.cjs");
   const appIcon = loadAppIcon();
+  // 启动 chrome：读 settings.theme + OS（对齐 Codex resolved theme）
+  let themePref: "system" | "light" | "dark" = "system";
+  try {
+    const t = readDesktopConfig().theme;
+    if (t === "light" || t === "dark" || t === "system") themePref = t;
+  } catch {
+    /* ignore */
+  }
+  applyNativeThemeSource(themePref);
+  const chromeTheme = resolveStartupChromeTheme();
+  const chrome = CHROME[chromeTheme];
   // Windows：隐藏标题栏图标+文字，保留顶部占位与系统按钮（布局不挤进客户区）
   const winTitleBar =
     process.platform === "win32"
       ? {
           titleBarStyle: "hidden" as const,
           titleBarOverlay: {
-            color: "#f5f5f5",
-            symbolColor: "#1a1a1a",
+            color: chrome.bg,
+            symbolColor: chrome.symbol,
             height: 36,
           },
         }
@@ -759,7 +845,7 @@ async function createWindow(): Promise<void> {
     minWidth: 720,
     minHeight: 480,
     title: "Grok Desktop",
-    backgroundColor: "#f5f5f5",
+    backgroundColor: chrome.bg,
     ...(appIcon ? { icon: appIcon } : {}),
     ...winTitleBar,
     // 对齐 Codex：无原生 File/Edit/View 菜单栏

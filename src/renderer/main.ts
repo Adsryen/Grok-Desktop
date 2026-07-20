@@ -27,6 +27,7 @@ import {
   SettingsPageController,
   type SettingsOpenTarget,
   type SettingsPermMode,
+  type SettingsThemePreference,
 } from "./settings-page.js";
 import { PluginsPageController } from "./plugins-page.js";
 import {
@@ -207,6 +208,10 @@ function effortOptions(): Array<{ id: EffortLevel; label: string }> {
 let defaultOpenTarget: SettingsOpenTarget = "explorer";
 /** UI language preference from settings (`system` | zh-CN | en-US) */
 let localePreference: LocalePreference = "system";
+/** Appearance preference（对齐 Codex Appearance：system | light | dark） */
+let themePreference: SettingsThemePreference = "system";
+let systemThemeMql: MediaQueryList | null = null;
+let systemThemeListener: ((ev: MediaQueryListEvent) => void) | null = null;
 /** Codex 可拖拽文件侧栏 */
 let sidePane: SidePaneController | null = null;
 /** Codex 式全页设置 */
@@ -7849,11 +7854,11 @@ async function showAutomationsModal(): Promise<void> {
     tr("nav.automations"),
     `
     <div style="display:grid;gap:8px;margin-bottom:12px">
-      <input id="auto-name" placeholder=tr("plug.mcpName") style="padding:8px 10px;border:1px solid #e5e5e5;border-radius:8px" />
-      <select id="auto-project" style="padding:8px 10px;border:1px solid #e5e5e5;border-radius:8px">
+      <input id="auto-name" placeholder=tr("plug.mcpName") style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text)" />
+      <select id="auto-project" style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text)">
         ${projects.map((p) => `<option value="${esc(p.id)}">${esc(p.title)}</option>`).join("")}
       </select>
-      <textarea id="auto-prompt" rows="3" placeholder="定时任务指令" style="padding:8px 10px;border:1px solid #e5e5e5;border-radius:8px"></textarea>
+      <textarea id="auto-prompt" rows="3" placeholder="定时任务指令" style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg-card);color:var(--text)"></textarea>
       <button type="button" class="btn-dark" id="btn-auto-create">创建</button>
     </div>
     ${(list.data ?? []).map((a) => `<div class="item"><div class="item-title">${esc(a.name)} · ${esc(a.status)}</div><div class="item-sub">${esc(a.prompt)}</div>
@@ -7885,11 +7890,70 @@ async function showAutomationsModal(): Promise<void> {
   };
 }
 
+function resolveTheme(pref: SettingsThemePreference): "light" | "dark" {
+  if (pref === "light" || pref === "dark") return pref;
+  try {
+    if (typeof matchMedia === "function") {
+      return matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light";
+    }
+  } catch {
+    /* ignore */
+  }
+  return "light";
+}
+
+function paintResolvedTheme(resolved: "light" | "dark"): void {
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved;
+  void inv("ui.setChromeTheme", { theme: resolved }).catch(() => {
+    /* older shell */
+  });
+}
+
+function bindSystemThemeListener(): void {
+  if (systemThemeMql && systemThemeListener) {
+    try {
+      systemThemeMql.removeEventListener("change", systemThemeListener);
+    } catch {
+      /* ignore */
+    }
+  }
+  systemThemeMql = null;
+  systemThemeListener = null;
+  if (themePreference !== "system") return;
+  try {
+    systemThemeMql = matchMedia("(prefers-color-scheme: dark)");
+    systemThemeListener = () => {
+      if (themePreference === "system") {
+        paintResolvedTheme(resolveTheme("system"));
+      }
+    };
+    systemThemeMql.addEventListener("change", systemThemeListener);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 应用外观偏好（写 localStorage 供 theme-boot 冷启动） */
+function applyThemePreference(pref: SettingsThemePreference): void {
+  themePreference = pref;
+  try {
+    localStorage.setItem("grok-desktop-theme", pref);
+  } catch {
+    /* ignore */
+  }
+  paintResolvedTheme(resolveTheme(pref));
+  bindSystemThemeListener();
+}
+
 function applyDesktopConfig(cfg: {
   defaultPermMode: SettingsPermMode;
   defaultModel: string;
   defaultOpenTarget: SettingsOpenTarget;
   locale?: LocalePreference;
+  theme?: SettingsThemePreference;
 }): void {
   // 只更新「新对话默认」；切换供应商等操作不得覆盖当前会话的权限模式 / 模型 chip
   defaultModelLabel = cfg.defaultModel || "grok";
@@ -7903,6 +7967,9 @@ function applyDesktopConfig(cfg: {
     syncPermLabels();
     setComposerPlaceholders(goalComposeActive);
     syncModelLabels();
+  }
+  if (cfg.theme !== undefined) {
+    applyThemePreference(cfg.theme);
   }
   if (!activeSessionId) {
     accessMode =
@@ -8846,21 +8913,25 @@ npm start</pre>
     alwaysApproveDefault?: boolean;
     defaultOpenTarget?: SettingsOpenTarget;
     locale?: LocalePreference;
+    theme?: SettingsThemePreference;
   }>("config.get");
   if (cfg.data) {
     const mode =
       cfg.data.defaultPermMode ??
       (cfg.data.alwaysApproveDefault ? "always_approve" : "normal");
     const pref = (cfg.data.locale ?? "system") as LocalePreference;
+    const themePref = (cfg.data.theme ?? "system") as SettingsThemePreference;
     applyDesktopConfig({
       defaultPermMode: mode,
       defaultModel: (cfg.data.defaultModel ?? "").trim() || "grok",
       defaultOpenTarget: cfg.data.defaultOpenTarget ?? "explorer",
       locale: pref,
+      theme: themePref,
     });
   } else {
     setLocale(resolveLocale("system", navigator.language));
     applyDomI18n(document);
+    applyThemePreference("system");
   }
 
   onLocaleChange(() => {

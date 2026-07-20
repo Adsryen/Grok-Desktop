@@ -14,6 +14,8 @@ type Inv = <T>(method: HostIpcMethod, params?: unknown) => Promise<{
 export type SettingsPermMode = "always_approve" | "normal";
 /** explorer | code | cursor | codium | windsurf | editor(遗留) */
 export type SettingsOpenTarget = string;
+/** Appearance: follow OS or force light/dark（对齐 Codex Appearance） */
+export type SettingsThemePreference = "system" | "light" | "dark";
 
 export interface DesktopConfigData {
   defaultModel?: string;
@@ -23,6 +25,8 @@ export interface DesktopConfigData {
   defaultOpenTarget?: SettingsOpenTarget;
   /** UI language preference */
   locale?: LocalePreference;
+  /** Appearance preference */
+  theme?: SettingsThemePreference;
   paths?: {
     settings: string;
     configToml: string;
@@ -39,6 +43,7 @@ export interface SettingsPageCallbacks {
     defaultModel: string;
     defaultOpenTarget: SettingsOpenTarget;
     locale?: LocalePreference;
+    theme?: SettingsThemePreference;
   }) => void;
   /** 关闭设置页后（恢复主界面交互 / 焦点） */
   onClosed?: () => void;
@@ -47,6 +52,7 @@ export interface SettingsPageCallbacks {
 
 type SectionId =
   | "general"
+  | "appearance"
   | "account"
   | "memory"
   | "shortcuts"
@@ -78,6 +84,13 @@ function settingsSections(): Array<{
       label: tr("settings.section.general"),
       icon: "⚙",
       keywords: tr("settings.kw.general"),
+    },
+    {
+      id: "appearance",
+      group: tr("settings.group.personal"),
+      label: tr("settings.section.appearance"),
+      icon: "◐",
+      keywords: tr("settings.kw.appearance"),
     },
     {
       id: "account",
@@ -252,11 +265,13 @@ export class SettingsPageController {
     const model = (this.cfg.defaultModel ?? "").trim() || "grok";
     const openTarget = this.cfg.defaultOpenTarget ?? "explorer";
     const locale = this.cfg.locale ?? "system";
+    const theme = this.cfg.theme ?? "system";
     this.cb.onConfigApplied({
       defaultPermMode: mode,
       defaultModel: model,
       defaultOpenTarget: openTarget,
       locale,
+      theme,
     });
   }
 
@@ -318,6 +333,10 @@ export class SettingsPageController {
           root.innerHTML = await this.htmlGeneral();
           this.bindGeneral(root);
           break;
+        case "appearance":
+          root.innerHTML = this.htmlAppearance();
+          this.bindAppearance(root);
+          break;
         case "account":
           root.innerHTML = await this.htmlAccount();
           this.bindAccount(root);
@@ -338,6 +357,37 @@ export class SettingsPageController {
       }
     } catch (err) {
       root.innerHTML = `<p class="settings-error">${this.cb.esc(String(err))}</p>`;
+    }
+  }
+
+  // ── 外观（独立侧栏，对齐 Codex Appearance）────────────────
+
+  private htmlAppearance(): string {
+    const theme = (this.cfg.theme ?? "system") as SettingsThemePreference;
+    return `
+      <h1 class="settings-title">${this.cb.esc(tr("settings.section.appearance"))}</h1>
+      <p class="settings-desc">${this.cb.esc(tr("settings.themeSub"))}</p>
+
+      <section class="settings-block">
+        <h2 class="settings-h2">${this.cb.esc(tr("settings.theme"))}</h2>
+        <div class="settings-choice-row">
+          ${this.choiceCard("theme", "system", theme === "system", tr("settings.theme.system"), tr("settings.theme.systemSub"))}
+          ${this.choiceCard("theme", "light", theme === "light", tr("settings.theme.light"), tr("settings.theme.lightSub"))}
+          ${this.choiceCard("theme", "dark", theme === "dark", tr("settings.theme.dark"), tr("settings.theme.darkSub"))}
+        </div>
+      </section>
+    `;
+  }
+
+  private bindAppearance(root: HTMLElement): void {
+    for (const el of Array.from(
+      root.querySelectorAll(".settings-choice[data-group=theme]"),
+    )) {
+      (el as HTMLElement).onclick = () => {
+        const v = (el as HTMLElement).dataset.value as SettingsThemePreference;
+        if (v !== "system" && v !== "light" && v !== "dark") return;
+        void this.patch({ theme: v }).then(() => this.renderContent());
+      };
     }
   }
 

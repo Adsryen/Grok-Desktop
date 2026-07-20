@@ -378,6 +378,7 @@ export class DesktopHost {
     defaultPermMode?: "always_approve" | "normal";
     defaultOpenTarget?: string;
     locale?: "zh-CN" | "en-US" | "system";
+    theme?: "system" | "light" | "dark";
   }) {
     const view = writeDesktopConfig(patch, this.home);
     if (patch.grokPathOverride !== undefined) {

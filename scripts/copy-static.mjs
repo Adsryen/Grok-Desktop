@@ -8,8 +8,11 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const srcRenderer = path.join(root, "src", "renderer");
 const destRenderer = path.join(root, "dist", "renderer");
 fs.mkdirSync(destRenderer, { recursive: true });
-for (const f of ["index.html", "styles.css"]) {
-  fs.copyFileSync(path.join(srcRenderer, f), path.join(destRenderer, f));
+for (const f of ["index.html", "styles.css", "theme-boot.js"]) {
+  const from = path.join(srcRenderer, f);
+  if (fs.existsSync(from)) {
+    fs.copyFileSync(from, path.join(destRenderer, f));
+  }
 }
 
 // Preload must ship as CommonJS for Electron

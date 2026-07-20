@@ -195,12 +195,15 @@ export const enUS: MessageDict = {
   "settings.group.personal": "Personal",
   "settings.group.integrations": "Integrations",
   "settings.section.general": "General",
+  "settings.section.appearance": "Appearance",
   "settings.section.account": "Account & providers",
   "settings.section.about": "About",
   "settings.section.memory": "Memory",
   "settings.section.shortcuts": "Keyboard shortcuts",
   "settings.kw.general":
     "permission open default full access plan language locale",
+  "settings.kw.appearance":
+    "theme appearance dark light system color scheme",
   "settings.kw.account":
     "login oauth official proxy provider api key base_url auth account",
   "settings.kw.about": "version diagnostics",
@@ -213,6 +216,16 @@ export const enUS: MessageDict = {
   "settings.language.system": "System default",
   "settings.language.zh": "简体中文",
   "settings.language.en": "English",
+  "settings.appearance": "Appearance",
+  "settings.theme": "Theme",
+  "settings.themeSub":
+    "Choose light, dark, or follow the system; applies immediately",
+  "settings.theme.system": "System",
+  "settings.theme.systemSub": "Match OS light / dark preference",
+  "settings.theme.light": "Light",
+  "settings.theme.lightSub": "Always use the light interface",
+  "settings.theme.dark": "Dark",
+  "settings.theme.darkSub": "Always use the dark interface",
   "settings.navAria": "Settings sections",
   "app.title": "Grok Desktop",
 

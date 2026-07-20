@@ -373,6 +373,8 @@ export interface DesktopConfigView {
   alwaysApproveDefault?: boolean;
   /** UI language: zh-CN | en-US | system */
   locale?: "zh-CN" | "en-US" | "system";
+  /** Appearance: system | light | dark */
+  theme?: "system" | "light" | "dark";
 }
 
 export interface HostResultOk<T> {
