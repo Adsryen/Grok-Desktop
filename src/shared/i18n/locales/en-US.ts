@@ -335,6 +335,16 @@ export const enUS: MessageDict = {
   "turn.thinking": "Thinking…",
   "turn.stopped": "Stopped",
   "turn.stopFailed": "Failed to stop",
+  /** Codex: Working for {time} */
+  "turn.workingFor": "Working · {time}",
+  /** Codex: Worked for {time} */
+  "turn.workedFor": "Done · {time}",
+  /** Codex: You stopped after {time} */
+  "turn.stoppedAfter": "Stopped · {time}",
+  "turn.timeMs": "{n}ms",
+  "turn.timeSec": "{n}s",
+  "turn.timeMin": "{m}m",
+  "turn.timeMinSec": "{m}m{s}s",
 
   // ── chat actions ───────────────────────────────────────
   "chat.copyMessage": "Copy message",
@@ -359,6 +369,9 @@ export const enUS: MessageDict = {
   "model.needProject": "Choose a project or folder first",
   "model.createFailed": "Failed to create session",
   "model.waitTurn": "Wait for the current turn before switching model/effort",
+  /** Provider/model removed from config */
+  "model.unavailableFallback":
+    "Model “{prev}” is unavailable; switched to {next}",
   "model.newSessionTitle": "New session required",
   "model.newSessionOk": "New session",
   "model.stayCurrent": "Stay on current",
@@ -504,11 +517,11 @@ export const enUS: MessageDict = {
   "welcome.askProject": "What should we do in {title}?",
   "welcome.askGeneric": "What should we work on?",
 
-  // ── process / elapsed ──────────────────────────────────
-  "process.elapsedMs": "Processed {n}ms",
-  "process.elapsedSec": "Processed {n}s",
-  "process.elapsedMin": "Processed {m}m",
-  "process.elapsedMinSec": "Processed {m}m{s}s",
+  // ── process / elapsed (legacy; primary path uses turn.workedFor) ──
+  "process.elapsedMs": "Done · {n}ms",
+  "process.elapsedSec": "Done · {n}s",
+  "process.elapsedMin": "Done · {m}m",
+  "process.elapsedMinSec": "Done · {m}m{s}s",
   "process.runningTool": "Running · {name}",
 
   // ── time absolute ──────────────────────────────────────
@@ -782,6 +795,18 @@ export const enUS: MessageDict = {
   "prov.baseHint": "OpenAI-compatible API root, usually ends with /v1",
   "prov.apiKey": "API Key",
   "prov.keyKeep": "Configured · leave blank to keep",
+  "prov.keyShow": "Show",
+  "prov.keyHide": "Hide",
+  "prov.keyShowTitle": "Show API key",
+  "prov.keyHideTitle": "Hide API key",
+  "prov.keyB64": "Base64→text",
+  "prov.keyB64Title":
+    "Decode Base64 in the field to a plain API key (some relays disguise keys)",
+  "prov.keyB64Hint":
+    "If the provider gave a Base64-disguised key, paste it then click Base64→text",
+  "prov.keyB64Empty": "Paste Base64 content first",
+  "prov.keyB64Fail": "Not valid Base64 plain text, or decode result unusable",
+  "prov.keyB64Ok": "Decoded to plain text (use Hide to mask)",
   "prov.protocol": "Protocol",
   "prov.fetchModels": "Fetch model list",
   "prov.displayName": "Display name (config section)",
@@ -912,6 +937,7 @@ export const enUS: MessageDict = {
   "history.empty": "No prompt history in this session yet",
   "history.noMatch": "No matches",
   "history.inserted": "Inserted into composer",
+  /** P0-A: light history-load marker (idle = send ↑) */
   "history.replayDone": "History loaded · {n} entries",
 
   // ── goal toasts ────────────────────────────────────────

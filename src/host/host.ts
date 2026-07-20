@@ -337,17 +337,39 @@ export class DesktopHost {
 
   providersUpsert(input: UpsertProviderInput) {
     const res = upsertCustomProvider(input, this.home);
+    this.modelsListCache = null;
     this.logger.info("providers.upsert", { id: input.id });
     return res;
   }
 
   providersRemove(id: string) {
     const res = removeCustomProvider(id, this.home);
-    this.logger.info("providers.remove", { id });
-    return res;
+    // 模型目录已变，作废缓存
+    this.modelsListCache = null;
+    const sid = (id ?? "").trim().toLowerCase();
+    const fallback = (res.defaultModel ?? "grok").trim() || "grok";
+    // 磁盘 meta：会话仍记着已删 provider id → 改回默认（对齐 CLI reselect）
+    const remapped = this.threadMeta.remapModels(
+      (m) => m.trim().toLowerCase() === sid,
+      fallback,
+    );
+    // 内存 live 线程同步
+    for (const live of this.threads.values()) {
+      const m = live.thread.model?.trim();
+      if (m && m.toLowerCase() === sid) {
+        live.thread.model = fallback;
+      }
+    }
+    this.logger.info("providers.remove", {
+      id,
+      fallback,
+      remappedSessions: remapped.updated,
+    });
+    return { ...res, remappedSessions: remapped.updated };
   }
 
   providersSetDefault(modelId: string) {
+    this.modelsListCache = null;
     return setDefaultModelId(modelId, this.home);
   }
 
@@ -469,6 +491,7 @@ export class DesktopHost {
           parentSessionId = parentSessionId ?? diskMeta.parentSessionId;
         }
       }
+      const rawModel = liveHit?.model ?? smeta.model;
       out.push({
         id: r.threadId ?? `disk_${r.sessionId}`,
         sessionId: r.sessionId,
@@ -476,7 +499,8 @@ export class DesktopHost {
         title: sanitizeListTitle(customTitle || r.title),
         cwd: r.cwd,
         status: r.status,
-        model: liveHit?.model ?? smeta.model,
+        // 展示/回填用「仍可用」的模型；幽灵 id 回退默认（不改写历史消息）
+        model: this.resolveAvailableModel(rawModel),
         effort: liveHit?.effort ?? smeta.effort,
         pinned: r.pinned,
         archived,
@@ -757,6 +781,11 @@ export class DesktopHost {
     });
 
     const smeta = this.threadMeta.get(sessionId);
+    const resolvedModel = this.resolveAvailableModel(smeta.model);
+    // 幽灵 model 写回 meta，避免下次仍读到已删 id
+    if (smeta.model && smeta.model !== resolvedModel) {
+      this.threadMeta.setSessionModel(sessionId, { model: resolvedModel });
+    }
     const thread: Thread =
       this.threads.get(threadId)?.thread ??
       ({
@@ -765,12 +794,12 @@ export class DesktopHost {
         title: `Resume ${sessionId.slice(0, 8)}`,
         cwd: resolvedCwd,
         status: "idle",
-        model: smeta.model,
+        model: resolvedModel,
         effort: smeta.effort,
         createdAt: now,
         updatedAt: now,
       } satisfies Thread);
-    if (smeta.model) thread.model = smeta.model;
+    thread.model = resolvedModel;
     if (smeta.effort) thread.effort = smeta.effort;
 
     this.threads.set(threadId, { thread, client, writable: true });
@@ -2174,6 +2203,42 @@ export class DesktopHost {
   /** `grok models` 结果缓存，避免每次点 chip 都 spawn */
   private modelsListCache: { at: number; list: ModelInfo[] } | null = null;
 
+  /** 当前全局默认模型 id（config / grok models / 内置） */
+  defaultModelId(): string {
+    const fromToml = listCustomProviders(this.home).defaultModel?.trim();
+    if (fromToml) return fromToml;
+    const list = this.modelsList();
+    const hit = list.find((m) => m.isDefault)?.id?.trim();
+    if (hit) return hit;
+    return list[0]?.id?.trim() || "grok";
+  }
+
+  /** 模型 id 是否仍在 catalog / 自定义提供商配置中 */
+  isModelAvailable(modelId: string | undefined | null): boolean {
+    const id = (modelId ?? "").trim();
+    if (!id) return false;
+    const list = this.modelsList();
+    if (list.some((m) => m.id === id)) return true;
+    // grok models 偶发漏列时：config 里仍有该 [model.id] 也算可用
+    try {
+      const { providers } = listCustomProviders(this.home);
+      if (providers.some((p) => p.id === id)) return true;
+    } catch {
+      /* ignore */
+    }
+    return false;
+  }
+
+  /**
+   * 对齐 CLI reselect_current_model_if_missing：
+   * 已存 model 不在目录 → 回退默认（展示/发送用）。
+   */
+  resolveAvailableModel(modelId: string | undefined | null): string {
+    const id = (modelId ?? "").trim();
+    if (id && this.isModelAvailable(id)) return id;
+    return this.defaultModelId();
+  }
+
   /** 列出可用模型（`grok models`；失败时回退内置表；默认缓存 5 分钟） */
   modelsList(opts?: { force?: boolean }): ModelInfo[] {
     const ttlMs = 5 * 60_000;
@@ -2185,6 +2250,21 @@ export class DesktopHost {
       return this.modelsListCache.list;
     }
     const list = this.modelsListUncached();
+    // 合并自定义提供商 id，保证 Desktop 添加的中转站一定出现在可选列表
+    try {
+      const { providers, defaultModel } = listCustomProviders(this.home);
+      for (const p of providers) {
+        if (!list.some((m) => m.id === p.id)) {
+          list.push({
+            id: p.id,
+            name: p.name || p.id,
+            isDefault: defaultModel === p.id,
+          });
+        }
+      }
+    } catch {
+      /* ignore */
+    }
     this.modelsListCache = { at: Date.now(), list };
     return list;
   }

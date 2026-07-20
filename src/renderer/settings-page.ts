@@ -42,6 +42,7 @@ export interface SettingsPageCallbacks {
     defaultPermMode: SettingsPermMode;
     defaultModel: string;
     defaultOpenTarget: SettingsOpenTarget;
+    /** 仅 locale/theme 真变更时传入，避免切换提供商时整页 applyDomI18n */
     locale?: LocalePreference;
     theme?: SettingsThemePreference;
   }) => void;
@@ -69,6 +70,38 @@ type CustomProviderRow = {
   apiBackend: string;
   isDefault: boolean;
 };
+
+/** Base64（含 url-safe）→ UTF-8 可打印文本；失败返回 ok:false */
+function decodeBase64ToPrintableText(
+  raw: string,
+): { ok: true; text: string } | { ok: false } {
+  let s = raw.trim().replace(/\s+/g, "");
+  s = s.replace(/^data:[^;]+;base64,/i, "");
+  // URL-safe Base64
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4 !== 0) s += "=";
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(s) || s.length < 4) {
+    return { ok: false };
+  }
+  try {
+    const bin = atob(s);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes).trim();
+    if (!text || text.length < 1) return { ok: false };
+    // 拒绝大量替换字符或控制符（除常见空白）
+    let bad = 0;
+    for (const ch of text) {
+      const c = ch.codePointAt(0) ?? 0;
+      if (c === 0xfffd || (c < 32 && c !== 9 && c !== 10 && c !== 13)) bad++;
+    }
+    if (bad > Math.max(2, text.length * 0.05)) return { ok: false };
+    if (text === raw.trim()) return { ok: false };
+    return { ok: true, text };
+  } catch {
+    return { ok: false };
+  }
+}
 
 function settingsSections(): Array<{
   id: SectionId;
@@ -183,9 +216,17 @@ export class SettingsPageController {
     document.getElementById("settings-page")?.classList.add("hidden");
     const app = document.getElementById("app");
     app?.classList.remove("settings-open");
-    app?.removeAttribute("aria-hidden");
-    if (app && "inert" in app) {
-      (app as HTMLElement & { inert: boolean }).inert = false;
+    const plugins = document.getElementById("plugins-page");
+    const pluginsVisible = Boolean(
+      plugins && !plugins.classList.contains("hidden"),
+    );
+    // 插件全页仍开着时保留 inert；否则恢复主壳
+    if (!pluginsVisible) {
+      app?.classList.remove("plugins-open");
+      app?.removeAttribute("aria-hidden");
+      if (app && "inert" in app) {
+        (app as HTMLElement & { inert: boolean }).inert = false;
+      }
     }
     this.cb.onClosed?.();
   }
@@ -259,22 +300,42 @@ export class SettingsPageController {
     const res = await this.cb.inv<DesktopConfigData>("config.patch", partial);
     if (res.ok && res.data) this.cfg = res.data;
     else await this.reloadConfig();
-    this.applyToApp();
+    // 只把本次 patch 涉及的 locale/theme 推给主界面，避免「设默认提供商」触发整页 i18n
+    this.applyToApp({
+      pushLocale: partial.locale !== undefined,
+      pushTheme: partial.theme !== undefined,
+    });
   }
 
-  private applyToApp(): void {
+  /**
+   * 将配置同步到主界面。
+   * 切换/删除提供商时不要带 locale/theme，否则 applyDomI18n(document) 在 #app.inert 下易导致关设置后无法输入。
+   */
+  private applyToApp(opts?: {
+    pushLocale?: boolean;
+    pushTheme?: boolean;
+  }): void {
     const mode = this.cfg.defaultPermMode ?? "normal";
     const model = (this.cfg.defaultModel ?? "").trim() || "grok";
     const openTarget = this.cfg.defaultOpenTarget ?? "explorer";
-    const locale = this.cfg.locale ?? "system";
-    const theme = this.cfg.theme ?? "system";
-    this.cb.onConfigApplied({
+    const payload: {
+      defaultPermMode: SettingsPermMode;
+      defaultModel: string;
+      defaultOpenTarget: SettingsOpenTarget;
+      locale?: LocalePreference;
+      theme?: SettingsThemePreference;
+    } = {
       defaultPermMode: mode,
       defaultModel: model,
       defaultOpenTarget: openTarget,
-      locale,
-      theme,
-    });
+    };
+    if (opts?.pushLocale) {
+      payload.locale = this.cfg.locale ?? "system";
+    }
+    if (opts?.pushTheme) {
+      payload.theme = this.cfg.theme ?? "system";
+    }
+    this.cb.onConfigApplied(payload);
   }
 
   private renderNav(): void {
@@ -728,10 +789,15 @@ export class SettingsPageController {
             <span class="settings-field-hint">${this.cb.esc(tr("prov.baseHint"))}</span>
           </label>
           <div class="settings-field-row">
-            <label class="settings-field">
+            <div class="settings-field">
               <span class="settings-field-label">${this.cb.esc(tr("prov.apiKey"))}</span>
-              <input class="settings-input" id="prov-key" type="password" value="" placeholder="${this.cb.esc(editing?.hasApiKey ? tr("prov.keyKeep") : "sk-…")}" autocomplete="new-password" />
-            </label>
+              <div class="settings-key-combo">
+                <input class="settings-input" id="prov-key" type="password" value="" placeholder="${this.cb.esc(editing?.hasApiKey ? tr("prov.keyKeep") : "sk-…")}" autocomplete="new-password" />
+                <button type="button" class="btn-ghost settings-mini-btn settings-key-vis-btn" id="btn-prov-key-vis" aria-pressed="false" title="${this.cb.esc(tr("prov.keyShowTitle"))}" aria-label="${this.cb.esc(tr("prov.keyShowTitle"))}">${this.cb.esc(tr("prov.keyShow"))}</button>
+                <button type="button" class="btn-ghost settings-mini-btn" id="btn-prov-key-b64" title="${this.cb.esc(tr("prov.keyB64Title"))}">${this.cb.esc(tr("prov.keyB64"))}</button>
+              </div>
+              <span class="settings-field-hint" id="prov-key-b64-hint">${this.cb.esc(tr("prov.keyB64Hint"))}</span>
+            </div>
             <label class="settings-field">
               <span class="settings-field-label">${this.cb.esc(tr("prov.protocol"))}</span>
               <select class="settings-select" id="prov-backend">
@@ -864,6 +930,65 @@ export class SettingsPageController {
         this.syncDisplayNameFromModel(root, modelInput.value.trim(), false);
       });
     }
+    root.querySelector("#btn-prov-key-vis")?.addEventListener("click", () => {
+      this.toggleProviderKeyVisibility(root);
+    });
+    root.querySelector("#btn-prov-key-b64")?.addEventListener("click", () => {
+      this.decodeProviderKeyBase64(root);
+    });
+  }
+
+  /** 明文显示 / 隐藏 API Key */
+  private toggleProviderKeyVisibility(root: HTMLElement): void {
+    const keyInput = root.querySelector("#prov-key") as HTMLInputElement | null;
+    const btn = root.querySelector(
+      "#btn-prov-key-vis",
+    ) as HTMLButtonElement | null;
+    if (!keyInput || !btn) return;
+    const show = keyInput.type === "password";
+    keyInput.type = show ? "text" : "password";
+    this.syncProviderKeyVisButton(btn, show);
+  }
+
+  private syncProviderKeyVisButton(
+    btn: HTMLButtonElement,
+    visible: boolean,
+  ): void {
+    btn.setAttribute("aria-pressed", visible ? "true" : "false");
+    btn.textContent = visible ? tr("prov.keyHide") : tr("prov.keyShow");
+    btn.title = visible ? tr("prov.keyHideTitle") : tr("prov.keyShowTitle");
+    btn.setAttribute(
+      "aria-label",
+      visible ? tr("prov.keyHideTitle") : tr("prov.keyShowTitle"),
+    );
+  }
+
+  /**
+   * 部分中转用 Base64「伪装」API Key：将输入框内容按 Base64 解成明文再写回。
+   * 失败不改动原值；仅接受可打印 UTF-8 文本。
+   */
+  private decodeProviderKeyBase64(root: HTMLElement): void {
+    const keyInput = root.querySelector("#prov-key") as HTMLInputElement | null;
+    const hint = root.querySelector("#prov-key-b64-hint");
+    const visBtn = root.querySelector(
+      "#btn-prov-key-vis",
+    ) as HTMLButtonElement | null;
+    if (!keyInput) return;
+    const raw = keyInput.value.trim();
+    if (!raw) {
+      if (hint) hint.textContent = tr("prov.keyB64Empty");
+      return;
+    }
+    const decoded = decodeBase64ToPrintableText(raw);
+    if (!decoded.ok) {
+      if (hint) hint.textContent = tr("prov.keyB64Fail");
+      return;
+    }
+    keyInput.value = decoded.text;
+    // 解码后自动明文，便于核对（可用「隐藏」收回）
+    keyInput.type = "text";
+    if (visBtn) this.syncProviderKeyVisButton(visBtn, true);
+    if (hint) hint.textContent = tr("prov.keyB64Ok");
   }
 
   private bindModelCombo(root: HTMLElement): void {

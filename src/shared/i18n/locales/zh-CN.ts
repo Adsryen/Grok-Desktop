@@ -323,6 +323,16 @@ export const zhCN = {
   "turn.thinking": "正在思考…",
   "turn.stopped": "已停止",
   "turn.stopFailed": "停止失败",
+  /** Codex：Working for {time} */
+  "turn.workingFor": "工作中 · {time}",
+  /** Codex：Worked for {time} */
+  "turn.workedFor": "已完成 · {time}",
+  /** Codex：You stopped after {time} */
+  "turn.stoppedAfter": "已停止 · {time}",
+  "turn.timeMs": "{n}ms",
+  "turn.timeSec": "{n}s",
+  "turn.timeMin": "{m}分",
+  "turn.timeMinSec": "{m}分{s}s",
 
   // ── chat actions ───────────────────────────────────────
   "chat.copyMessage": "复制消息",
@@ -347,6 +357,8 @@ export const zhCN = {
   "model.needProject": "请先选择项目或目录",
   "model.createFailed": "创建新会话失败",
   "model.waitTurn": "请等待当前回合结束再切换模型/推理",
+  /** 提供商/模型已从配置消失 */
+  "model.unavailableFallback": "模型「{prev}」已不可用，已切换为 {next}",
   "model.newSessionTitle": "需要新会话",
   "model.newSessionOk": "新会话",
   "model.stayCurrent": "留在当前",
@@ -489,11 +501,11 @@ export const zhCN = {
   "welcome.askProject": "我们应该在 {title} 中做些什么？",
   "welcome.askGeneric": "我们应该做些什么？",
 
-  // ── process / elapsed ──────────────────────────────────
-  "process.elapsedMs": "已处理 {n}ms",
-  "process.elapsedSec": "已处理 {n}s",
-  "process.elapsedMin": "已处理 {m}分",
-  "process.elapsedMinSec": "已处理 {m}分{s}s",
+  // ── process / elapsed（兼容；主路径用 turn.workedFor）──
+  "process.elapsedMs": "已完成 · {n}ms",
+  "process.elapsedSec": "已完成 · {n}s",
+  "process.elapsedMin": "已完成 · {m}分",
+  "process.elapsedMinSec": "已完成 · {m}分{s}s",
   "process.runningTool": "正在运行 · {name}",
 
   // ── time absolute ──────────────────────────────────────
@@ -760,6 +772,18 @@ export const zhCN = {
   "prov.baseHint": "OpenAI 兼容 API 根路径，通常以 /v1 结尾",
   "prov.apiKey": "API Key",
   "prov.keyKeep": "已配置 · 留空则保留",
+  "prov.keyShow": "显示",
+  "prov.keyHide": "隐藏",
+  "prov.keyShowTitle": "明文显示 API Key",
+  "prov.keyHideTitle": "隐藏 API Key",
+  "prov.keyB64": "Base64→明文",
+  "prov.keyB64Title":
+    "将输入框中的 Base64 解码为明文 Key（部分中转会用 Base64 伪装）",
+  "prov.keyB64Hint":
+    "若供应商给的是 Base64 伪装的 Key，先粘贴再点「Base64→明文」",
+  "prov.keyB64Empty": "请先粘贴 Base64 内容",
+  "prov.keyB64Fail": "不是有效的 Base64 明文，或解码结果不可用",
+  "prov.keyB64Ok": "已解码为明文（可点「隐藏」）",
   "prov.protocol": "协议",
   "prov.fetchModels": "拉取模型列表",
   "prov.displayName": "显示名称（配置段）",
@@ -936,6 +960,7 @@ export const zhCN = {
   "crash.needSession": "无活动会话可附着",
   "crash.attachFail": "无法恢复会话",
 
+  /** P0-A：历史回放弱提示（空闲由发送钮 ↑ 表达） */
   "history.replayDone": "已加载历史 · {n} 条",
 
   "search.resumeHint": "搜索项目 / 对话 / 符号；输入 session id 可精确 resume（对齐 CLI -r）",

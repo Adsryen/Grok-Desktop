@@ -2690,6 +2690,96 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
   40% { opacity: 1; transform: translateY(-2px); }
 }
 .turn-status .status-label { font-weight: 500; color: var(--text-2); }
+.turn-status.is-done .status-label { color: var(--ok, #15803d); }
+.turn-status.is-stopped .status-label { color: var(--text-3); }
+.turn-status .status-check {
+  font-size: 12px;
+  color: var(--ok, #15803d);
+  width: 1em;
+  text-align: center;
+}
+.turn-status.is-stopped .status-check { color: var(--text-3); }
+.turn-status.is-fading {
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+/* Codex：Working for / Worked for 时间线分隔 */
+.line.turn-phase {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 4px 0 14px;
+  padding: 2px 0 0;
+  max-width: 100%;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 10px;
+}
+.turn-phase-label {
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--text-3);
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+.turn-phase.is-working .turn-phase-label {
+  color: var(--text-2);
+}
+.turn-phase.is-done .turn-phase-label {
+  color: var(--text-2);
+}
+.turn-phase.is-stopped .turn-phase-label {
+  color: var(--text-3);
+}
+/* P0-A：历史加载弱提示（仅「已加载历史 · N」，非 Working / 非空闲文案） */
+.turn-phase.is-history {
+  justify-content: flex-start;
+}
+.turn-phase.is-history .turn-phase-label {
+  color: var(--text-3);
+  font-weight: 400;
+  opacity: 0.9;
+}
+.turn-phase-dots {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+.turn-phase-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--text-3);
+  display: block;
+  animation: status-bounce 1.2s ease-in-out infinite;
+}
+.turn-phase-dots i:nth-child(2) { animation-delay: 0.15s; }
+.turn-phase-dots i:nth-child(3) { animation-delay: 0.3s; }
+
+/* 过程块下方：已处理耗时（兼容旧 class） */
+.line.turn-elapsed {
+  margin: 0 0 16px;
+  padding: 2px 0 0;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.turn-elapsed-label {
+  font-size: 12.5px;
+  color: var(--text-3);
+  line-height: 1.4;
+  margin: 0 0 10px;
+  text-align: right;
+  align-self: flex-end;
+}
+.turn-elapsed-rule {
+  height: 1px;
+  width: 100%;
+  background: var(--border-soft);
+  border: 0;
+}
 
 /* 会话中隐藏思考过程 UI（逻辑见 appendThoughtDelta） */
 .line.thought-block {
@@ -2736,29 +2826,6 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
   border-radius: 12px;
   background: #f7f7f8;
   overflow: hidden;
-}
-/* 过程块下方：已处理耗时（右对齐）+ 分割线 */
-.line.turn-elapsed {
-  margin: 0 0 16px;
-  padding: 2px 0 0;
-  max-width: 100%;
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-}
-.turn-elapsed-label {
-  font-size: 12.5px;
-  color: var(--text-3);
-  line-height: 1.4;
-  margin: 0 0 10px;
-  text-align: right;
-  align-self: flex-end;
-}
-.turn-elapsed-rule {
-  height: 1px;
-  width: 100%;
-  background: var(--border-soft);
-  border: 0;
 }
 .process-toggle {
   display: flex;
@@ -4314,6 +4381,21 @@ dialog input {
 }
 .settings-field-row-models {
   border-top: 1px solid var(--border);
+}
+/* API Key：输入框 + 显示/隐藏 + Base64→明文 */
+.settings-key-combo {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+}
+.settings-key-combo .settings-input {
+  flex: 1;
+  min-width: 0;
+}
+.settings-key-combo .settings-mini-btn {
+  flex-shrink: 0;
+  align-self: center;
 }
 /* 实际请求模型：输入框 + 尾部下拉箭头 + 弹出菜单 */
 .settings-model-combo {

@@ -419,9 +419,14 @@ let promptHistory: string[] = [];
 let promptHistoryIndex = -1;
 /** 进入 ↑ 浏览前保存的草稿 */
 let promptHistoryDraft = "";
-/** 当前 turn 开始时间（用于过程块下「已处理 Xs」） */
+/** 当前 turn 开始时间（Working for / Worked for 计时） */
 let turnStartedAt = 0;
 let turnStatusEl: HTMLElement | null = null;
+/** Codex 式时间线分隔：进行中 Working for / 结束后 Worked for */
+let turnPhaseEl: HTMLElement | null = null;
+let turnPhaseTimer: ReturnType<typeof setInterval> | null = null;
+/** 完成态状态条淡出定时器 */
+let turnStatusDoneTimer: ReturnType<typeof setTimeout> | null = null;
 let thoughtBlockEl: HTMLElement | null = null;
 let thoughtBodyEl: HTMLElement | null = null;
 /** 方案 A：工具 + goal 验证过程默认折叠 */
@@ -493,36 +498,144 @@ function updateProcessHeader(): void {
   }
 }
 
-/** 格式化为「已处理 23s」/「已处理 800ms」 */
-function formatTurnElapsed(ms: number): string {
+/** 短耗时：23s / 800ms / 1分5s */
+function formatElapsedCompact(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) ms = 0;
-  if (ms < 1000) return tr("process.elapsedMs", { n: Math.max(ms, 0) });
+  if (ms < 1000) return tr("turn.timeMs", { n: Math.max(ms, 0) });
   const sec = Math.round(ms / 1000);
-  if (sec < 60) return tr("process.elapsedSec", { n: sec });
+  if (sec < 60) return tr("turn.timeSec", { n: sec });
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return s > 0
-    ? tr("process.elapsedMinSec", { m, s })
-    : tr("process.elapsedMin", { m });
+    ? tr("turn.timeMinSec", { m, s })
+    : tr("turn.timeMin", { m });
+}
+
+/** 兼容旧 key：已处理 → 现统一走「已完成 ·」 */
+function formatTurnElapsed(ms: number): string {
+  return tr("turn.workedFor", { time: formatElapsedCompact(ms) });
+}
+
+function formatTurnWorking(ms: number): string {
+  return tr("turn.workingFor", { time: formatElapsedCompact(ms) });
+}
+
+function formatTurnStopped(ms: number): string {
+  return tr("turn.stoppedAfter", { time: formatElapsedCompact(ms) });
+}
+
+function stopTurnPhaseTimer(): void {
+  if (turnPhaseTimer != null) {
+    clearInterval(turnPhaseTimer);
+    turnPhaseTimer = null;
+  }
+}
+
+function clearTurnStatusDoneTimer(): void {
+  if (turnStatusDoneTimer != null) {
+    clearTimeout(turnStatusDoneTimer);
+    turnStatusDoneTimer = null;
+  }
 }
 
 /**
- * 在过程块下方插入「已处理 Xs」+ 分割线（对齐 Codex）
- * 同一过程块只保留一条 footer
+ * Codex：Working for {time} — 进行中分隔条，计时 live。
+ * 挂在 transcript 末尾（工具/过程之后会自然落在活动段下方）。
  */
-function paintProcessElapsedFooter(elapsedMs: number): void {
-  if (!processBlockEl?.isConnected || processItemCount <= 0) return;
-  const prev = processBlockEl.nextElementSibling;
-  if (prev?.classList.contains("turn-elapsed")) {
-    prev.remove();
+function ensureTurnPhaseWorking(): void {
+  const root = $("transcript");
+  if (!turnPhaseEl?.isConnected) {
+    const div = document.createElement("div");
+    div.className = "line turn-phase is-working";
+    div.setAttribute("role", "status");
+    div.innerHTML =
+      `<span class="turn-phase-dots" aria-hidden="true"><i></i><i></i><i></i></span>` +
+      `<span class="turn-phase-label"></span>`;
+    root.appendChild(div);
+    turnPhaseEl = div;
+  } else {
+    turnPhaseEl.classList.add("is-working");
+    turnPhaseEl.classList.remove("is-done", "is-stopped", "is-history");
+    // 工具/过程追加后仍把 Working 钉在时间线末尾
+    if (turnPhaseEl.parentElement === root && root.lastElementChild !== turnPhaseEl) {
+      root.appendChild(turnPhaseEl);
+    }
   }
+  const tick = () => {
+    if (!turnActive || !turnPhaseEl?.isConnected) return;
+    const ms = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
+    const lab = turnPhaseEl.querySelector(".turn-phase-label");
+    const text = formatTurnWorking(ms);
+    if (lab) lab.textContent = text;
+    turnPhaseEl.setAttribute("aria-label", text);
+    // 每秒顺带把条钉回底部（tool/assistant 插入后）
+    const rootEl = $("transcript");
+    if (
+      turnPhaseEl.parentElement === rootEl &&
+      rootEl.lastElementChild !== turnPhaseEl
+    ) {
+      rootEl.appendChild(turnPhaseEl);
+    }
+  };
+  tick();
+  stopTurnPhaseTimer();
+  turnPhaseTimer = setInterval(tick, 1000);
+  scrollTranscript();
+}
+
+/**
+ * Codex：Worked for / You stopped after — 固定留在时间线。
+ * 插在过程块后，否则 transcript 末尾。
+ */
+function paintTurnPhaseDone(
+  kind: "worked" | "stopped",
+  elapsedMs: number,
+): void {
+  stopTurnPhaseTimer();
+  const label =
+    kind === "stopped"
+      ? formatTurnStopped(elapsedMs)
+      : formatTurnElapsed(elapsedMs);
+  // 复用进行中的 phase 节点，改成完成态（避免两条分隔）
+  if (turnPhaseEl?.isConnected) {
+    turnPhaseEl.classList.remove("is-working");
+    turnPhaseEl.classList.add(kind === "stopped" ? "is-stopped" : "is-done");
+    turnPhaseEl.innerHTML = `<span class="turn-phase-label">${esc(label)}</span>`;
+    turnPhaseEl.setAttribute("aria-label", label);
+    // 挪到过程块之后（若过程块在它后面插入过）
+    if (processBlockEl?.isConnected) {
+      const next = processBlockEl.nextElementSibling;
+      if (next !== turnPhaseEl) {
+        processBlockEl.insertAdjacentElement("afterend", turnPhaseEl);
+      }
+    }
+    scrollTranscript();
+    return;
+  }
+
+  // 清掉旧 footer 类名节点（兼容）
+  if (processBlockEl?.isConnected) {
+    const prev = processBlockEl.nextElementSibling;
+    if (prev?.classList.contains("turn-elapsed")) prev.remove();
+  }
+
   const foot = document.createElement("div");
-  foot.className = "line turn-elapsed";
-  foot.setAttribute("aria-label", formatTurnElapsed(elapsedMs));
-  foot.innerHTML =
-    `<div class="turn-elapsed-label">${esc(formatTurnElapsed(elapsedMs))}</div>` +
-    `<div class="turn-elapsed-rule" role="separator"></div>`;
-  processBlockEl.insertAdjacentElement("afterend", foot);
+  foot.className = `line turn-phase ${kind === "stopped" ? "is-stopped" : "is-done"}`;
+  foot.setAttribute("role", "status");
+  foot.setAttribute("aria-label", label);
+  foot.innerHTML = `<span class="turn-phase-label">${esc(label)}</span>`;
+  if (processBlockEl?.isConnected) {
+    processBlockEl.insertAdjacentElement("afterend", foot);
+  } else {
+    $("transcript").appendChild(foot);
+  }
+  turnPhaseEl = foot;
+  scrollTranscript();
+}
+
+/** @deprecated 名保留；逻辑并入 paintTurnPhaseDone */
+function paintProcessElapsedFooter(elapsedMs: number): void {
+  paintTurnPhaseDone("worked", elapsedMs);
 }
 
 function ensureProcessBlock(): { block: HTMLElement; body: HTMLElement } {
@@ -622,7 +735,10 @@ function clearTranscript(): void {
   $("transcript").innerHTML = "";
   nextUserPromptIndex = 0;
   resetStreamState(false);
+  clearTurnStatusDoneTimer();
+  stopTurnPhaseTimer();
   turnStatusEl = null;
+  turnPhaseEl = null;
   thoughtBlockEl = null;
   thoughtBodyEl = null;
   processBlockEl = null;
@@ -812,6 +928,7 @@ function bindChatScrollLayout(): void {
   requestAnimationFrame(() => syncChatComposerReserve());
 }
 
+/** 空闲 / 进行中：仅由发送钮 ↑ / ■ 表达（方案 2） */
 function setComposerBusy(busy: boolean): void {
   for (const id of ["btn-send", "btn-send-chat"] as const) {
     const b = $(id);
@@ -1612,9 +1729,15 @@ function markSessionWorking(sessionId: string | null, working: boolean): void {
 }
 
 function ensureTurnStatus(label = tr("turn.thinking")): HTMLElement {
+  clearTurnStatusDoneTimer();
   if (turnStatusEl && turnStatusEl.isConnected) {
+    turnStatusEl.classList.remove("is-done", "is-stopped");
     const lab = turnStatusEl.querySelector(".status-label");
     if (lab) lab.textContent = label;
+    // 恢复进行中圆点
+    if (!turnStatusEl.querySelector(".status-dots")) {
+      turnStatusEl.innerHTML = `<span class="status-dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="status-label">${esc(label)}</span>`;
+    }
     return turnStatusEl;
   }
   const el = $("transcript");
@@ -1628,18 +1751,61 @@ function ensureTurnStatus(label = tr("turn.thinking")): HTMLElement {
 }
 
 function removeTurnStatus(): void {
+  clearTurnStatusDoneTimer();
   if (turnStatusEl?.isConnected) turnStatusEl.remove();
   turnStatusEl = null;
+}
+
+/** 结束时：状态条改完成文案，短暂保留后移除（不立刻消失） */
+function promoteTurnStatusToDone(
+  label: string,
+  kind: "done" | "stopped" = "done",
+): void {
+  clearTurnStatusDoneTimer();
+  if (!turnStatusEl?.isConnected) {
+    const div = document.createElement("div");
+    div.className = `line turn-status ${kind === "stopped" ? "is-stopped" : "is-done"}`;
+    div.innerHTML = `<span class="status-check" aria-hidden="true">${kind === "stopped" ? "■" : "✓"}</span><span class="status-label">${esc(label)}</span>`;
+    $("transcript").appendChild(div);
+    turnStatusEl = div;
+  } else {
+    turnStatusEl.classList.add(kind === "stopped" ? "is-stopped" : "is-done");
+    turnStatusEl.classList.remove("is-working");
+    turnStatusEl.innerHTML = `<span class="status-check" aria-hidden="true">${kind === "stopped" ? "■" : "✓"}</span><span class="status-label">${esc(label)}</span>`;
+  }
+  scrollTranscript();
+  turnStatusDoneTimer = setTimeout(() => {
+    turnStatusDoneTimer = null;
+    if (turnStatusEl?.isConnected) {
+      turnStatusEl.classList.add("is-fading");
+      const el = turnStatusEl;
+      window.setTimeout(() => {
+        if (el.isConnected) el.remove();
+        if (turnStatusEl === el) turnStatusEl = null;
+      }, 320);
+    }
+  }, 2800);
 }
 
 function setTurnStatus(label: string): void {
   if (!turnActive) return;
   ensureTurnStatus(label);
+  // 工具名变化时同步刷新 Working for 旁的辅助信息（可选）
+  if (turnPhaseEl?.classList.contains("is-working")) {
+    const ms = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
+    const lab = turnPhaseEl.querySelector(".turn-phase-label");
+    const text = formatTurnWorking(ms);
+    if (lab) lab.textContent = text;
+  }
 }
 
 function beginTurn(): void {
   // 先定稿并切断上一 turn 的流式指针，防止新 delta 拼进旧气泡
   resetStreamState(true);
+  clearTurnStatusDoneTimer();
+  stopTurnPhaseTimer();
+  // 新回合开始：上一轮 phase 留在时间线，本轮新建
+  turnPhaseEl = null;
   turnActive = true;
   lateStreamUntil = 0;
   turnStartedAt = Date.now();
@@ -1653,15 +1819,26 @@ function beginTurn(): void {
   processItemCount = 0;
   streamIsProcess = false;
   ensureTurnStatus(tr("turn.thinking"));
+  ensureTurnPhaseWorking();
   setComposerBusy(true);
   if (activeSessionId) markSessionWorking(activeSessionId, true);
 }
 
-function endTurn(opts?: { keepThought?: boolean; skipQueueDrain?: boolean }): void {
+function endTurn(opts?: {
+  keepThought?: boolean;
+  skipQueueDrain?: boolean;
+  /** 对齐 Codex：正常完成 Worked for / 用户停止 You stopped after */
+  outcome?: "worked" | "stopped";
+}): void {
+  // 无活跃回合时只做清理，不画「已完成 · 0ms」（openThread/rewind 会误触）
+  const hadTurn = turnActive || turnStartedAt > 0;
   // 先放行迟到流，再关 busy；不立刻丢弃末包
-  lateStreamUntil = Date.now() + 4000;
+  if (hadTurn) lateStreamUntil = Date.now() + 4000;
+  const elapsed = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
+  const outcome = opts?.outcome ?? "worked";
   turnActive = false;
-  removeTurnStatus();
+  stopTurnPhaseTimer();
+
   endProcessTextStream();
   // 折叠思考块（保留在时间线）
   if (thoughtBlockEl?.isConnected && !opts?.keepThought) {
@@ -1669,16 +1846,27 @@ function endTurn(opts?: { keepThought?: boolean; skipQueueDrain?: boolean }): vo
     const caret = thoughtBlockEl.querySelector(".thought-caret");
     if (caret) caret.textContent = "▸";
   }
-  // 过程块默认收起 + 下方「已处理 Xs」分割线
+  // 过程块默认收起
   if (processBlockEl?.isConnected) {
     processBlockEl.classList.add("collapsed");
     const caret = processBlockEl.querySelector(".process-caret");
     if (caret) caret.textContent = "▸";
     updateProcessHeader();
-    const elapsed =
-      turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
-    paintProcessElapsedFooter(elapsed);
   }
+  if (hadTurn) {
+    // Codex：Worked for / You stopped after — 有无过程块都固定留下
+    paintTurnPhaseDone(outcome === "stopped" ? "stopped" : "worked", elapsed);
+    // 状态条：先显示完成态再淡出（不立刻消失）
+    promoteTurnStatusToDone(
+      outcome === "stopped"
+        ? formatTurnStopped(elapsed)
+        : formatTurnElapsed(elapsed),
+      outcome === "stopped" ? "stopped" : "done",
+    );
+  } else {
+    removeTurnStatus();
+  }
+
   turnStartedAt = 0;
   // 未完成的 tool 行标为结束
   Array.from(
@@ -1711,6 +1899,32 @@ function endTurn(opts?: { keepThought?: boolean; skipQueueDrain?: boolean }): vo
   if (!opts?.skipQueueDrain) scheduleDrainPromptQueue();
 }
 
+/**
+ * P0-A：历史回放结束 — 仅弱提示「已加载历史 · N」。
+ * 空闲语义交给发送钮 ↑；勿与 Working 混淆，不写「会话空闲」。
+ */
+function paintHistoryReplayDone(entryCount: number): void {
+  removeTurnStatus();
+  stopTurnPhaseTimer();
+  // 历史不是进行中 turn，切断 phase 指针
+  if (turnPhaseEl?.classList.contains("is-working")) {
+    turnPhaseEl.remove();
+  }
+  turnPhaseEl = null;
+  turnStartedAt = 0;
+
+  if (entryCount <= 0) return;
+
+  const main = tr("history.replayDone", { n: String(entryCount) });
+  const div = document.createElement("div");
+  div.className = "line turn-phase is-history";
+  div.setAttribute("role", "status");
+  div.setAttribute("aria-label", main);
+  div.innerHTML = `<span class="turn-phase-label">${esc(main)}</span>`;
+  $("transcript").appendChild(div);
+  scrollTranscript();
+}
+
 async function cancelTurn(opts?: { clearQueue?: boolean }): Promise<void> {
   if (!turnActive) return;
   const tid =
@@ -1728,14 +1942,13 @@ async function cancelTurn(opts?: { clearQueue?: boolean }): Promise<void> {
   if (tid) {
     const res = await inv("turns.cancel", { threadId: tid });
     if (!res.ok) {
-      endTurn();
+      endTurn({ outcome: "stopped" });
       appendLine(res.error?.message ?? tr("turn.stopFailed"), "error");
       return;
     }
   }
   // endTurn → scheduleDrain；queuePausedByInterrupt 时 schedule 为空操作
-  endTurn();
-  appendLine(tr("turn.stopped"), "system");
+  endTurn({ outcome: "stopped" });
   // 停止后再同源暂停 goal（避免与 cancel 抢 prompt）
   if (shouldPauseGoal) {
     await pauseGoal({ fromStop: true });
@@ -2758,7 +2971,7 @@ function applyDefaultToChip(): void {
   syncModelLabels();
 }
 
-/** 打开会话：chip 显示该会话记忆的模型（无则用默认） */
+/** 打开会话：chip 显示该会话记忆的模型（Host 已 resolve 幽灵 id；再异步校验目录） */
 function applyThreadToChip(t: {
   model?: string;
   effort?: string;
@@ -2767,6 +2980,8 @@ function applyThreadToChip(t: {
   modelLabel = m || defaultModelLabel || "grok";
   effortLevel = parseEffort(t.effort) ?? defaultEffortLevel;
   syncModelLabels();
+  // 目录可能刚删提供商：异步确认 chip 仍可选
+  void ensureChipModelAvailable({ toast: Boolean(m) });
 }
 
 /** agent 因 harness 不兼容拒绝热切换（对齐 CLI：需新会话） */
@@ -3073,11 +3288,62 @@ function hideModelMenu(): void {
 }
 
 function modelsForMenu(list: ModelRow[]): ModelRow[] {
-  const models = list.map((m) => ({ ...m }));
-  if (modelLabel && !models.some((m) => m.id === modelLabel)) {
-    models.unshift({ id: modelLabel, name: modelLabel });
+  // 不再把「已从目录消失」的幽灵 id 塞回菜单（删提供商后的假选项）
+  return list.map((m) => ({ ...m }));
+}
+
+/** 设置 / 插件全页是否盖住主壳（此时勿 setModel、勿抢焦点） */
+function isMainShellOverlayOpen(): boolean {
+  if (settingsPage?.isOpen()) return true;
+  const plugins = document.getElementById("plugins-page");
+  if (plugins && !plugins.classList.contains("hidden")) return true;
+  return false;
+}
+
+/**
+ * chip 模型须在可选目录内；否则回退默认（对齐 CLI reselect）。
+ * @returns true = 未改动；false = 已回退
+ */
+async function ensureChipModelAvailable(opts?: {
+  toast?: boolean;
+  /** 全页设置打开时禁止 setModel（延后到 onClosed） */
+  allowSetModel?: boolean;
+}): Promise<boolean> {
+  const want = (modelLabel || "").trim();
+  const list = await fetchModelsList();
+  if (want && list.some((m) => m.id === want)) return true;
+  const prev = want || "(empty)";
+  const next =
+    (defaultModelLabel || "").trim() ||
+    list.find((m) => m.isDefault)?.id?.trim() ||
+    list[0]?.id?.trim() ||
+    "grok";
+  // 默认本身也可能已从目录消失时，再落到列表首项
+  const resolved = list.some((m) => m.id === next)
+    ? next
+    : list[0]?.id?.trim() || "grok";
+  if (resolved === want) return true;
+  modelLabel = resolved;
+  syncModelLabels();
+  // 设置/插件盖住主壳时只改 chip，不打 setModel（避免与 inert 恢复竞态）
+  const canSetModel =
+    opts?.allowSetModel !== false && !isMainShellOverlayOpen();
+  if (
+    canSetModel &&
+    activeThreadId &&
+    !activeThreadId.startsWith("disk_") &&
+    activeSessionId
+  ) {
+    void inv("threads.setModel", {
+      threadId: activeThreadId,
+      modelId: resolved,
+      effort: effortLevel,
+    }).catch(() => undefined);
   }
-  return models;
+  if (opts?.toast && want && want !== resolved && !isMainShellOverlayOpen()) {
+    showToast(tr("model.unavailableFallback", { prev, next: resolved }));
+  }
+  return false;
 }
 
 function shortModelName(id: string = modelLabel): string {
@@ -5613,6 +5879,28 @@ async function syncGoalFromAgent(): Promise<void> {
   }
 }
 
+/**
+ * 清掉目标 UI 内存态（不弹 toast）。
+ * 用于：磁盘 cancelled/cleared、换会话、用户 clear。
+ */
+function resetGoalUiState(): void {
+  pendingGoalTitle = null;
+  activeGoalTitle = null;
+  userOptedInGoal = false;
+  goalPaused = false;
+  goalStartedAt = null;
+  goalElapsedFrozenMs = 0;
+  goalCompleted = false;
+  goalComposeActive = false;
+  if (goalCompleteHideTimer) {
+    clearTimeout(goalCompleteHideTimer);
+    goalCompleteHideTimer = null;
+  }
+  stopGoalSyncTimer();
+  stopGoalElapsedTimer();
+  setComposerPlaceholders(false);
+}
+
 function renderGoalBanner(): void {
   const title = currentGoalTitle();
   const on = Boolean(title);
@@ -5637,15 +5925,20 @@ function renderGoalBanner(): void {
     pauseBtn?.classList.toggle("hidden", goalPaused || goalCompleted);
     resumeBtn?.classList.toggle("hidden", !goalPaused || goalCompleted);
   }
-  if (on && !goalPaused && !goalCompleted) {
+  // 冷加载 active：无 goalStartedAt 时只显示冻结耗时，不假装从 updatedAt 狂跳
+  const canTick = on && !goalPaused && !goalCompleted && goalStartedAt != null;
+  if (canTick) {
     startGoalElapsedTimer();
     ensureGoalSyncTimer();
   } else {
     stopGoalElapsedTimer();
-    if (!on || goalCompleted) stopGoalSyncTimer();
+    if (on && !goalCompleted) ensureGoalSyncTimer();
+    else if (!on || goalCompleted) stopGoalSyncTimer();
     const el = formatGoalElapsed(goalElapsedMsNow());
     for (const node of Array.from(document.querySelectorAll("[data-goal-elapsed]"))) {
-      node.textContent = on ? el : "";
+      // 无起点且冻结为 0：不显示 · 0s，避免「假运行」
+      node.textContent =
+        on && (goalStartedAt != null || goalElapsedFrozenMs > 0) ? el : "";
     }
   }
   syncSessionModeChips();
@@ -5831,6 +6124,29 @@ function applyAgentGoalEvent(ev: {
     st === "completed" ||
     last === "goal_completed" ||
     last.includes("completed");
+  // CLI：cleared / cancelled / canceled 均为无目标终态
+  const isCleared =
+    st === "cancelled" ||
+    st === "canceled" ||
+    st === "cleared" ||
+    last === "goal_cleared" ||
+    last === "goal_cancelled";
+
+  // 终态 cleared：先于 opt-in / title 写入，避免空 objective 被当成 "Goal" 进行中
+  if (isCleared) {
+    const had = Boolean(currentGoalTitle() || userOptedInGoal);
+    resetGoalUiState();
+    renderGoalBanner();
+    // 磁盘同步清理，防止下次 open 再误显
+    if (activeSessionId) {
+      void inv("goals.clear", { sessionId: activeSessionId });
+    }
+    // 仅用户可见的取消才 toast；冷加载 sync 的 cleared 静默
+    if (had && (st === "cancelled" || st === "canceled") && last) {
+      showToast(tr("goal.cancelledToast"));
+    }
+    return;
+  }
 
   // agent 首启 goal：自动 opt-in（与 Host goal.json 投影对齐）
   if (!userOptedInGoal) {
@@ -5841,9 +6157,6 @@ function applyAgentGoalEvent(ev: {
       st === "user_paused" ||
       st === "paused" ||
       st === "blocked" ||
-      st === "cancelled" ||
-      st === "canceled" ||
-      st === "cleared" ||
       last.startsWith("goal_");
     if (!meaningful && !currentGoalTitle() && !goalComposeActive) {
       return;
@@ -5864,7 +6177,7 @@ function applyAgentGoalEvent(ev: {
   }
 
   if (isComplete) {
-    markGoalCompletedUi(ev.message?.trim() || title || "目标已完成");
+    markGoalCompletedUi(ev.message?.trim() || title || tr("goal.completedToast"));
     return;
   }
 
@@ -5891,22 +6204,12 @@ function applyAgentGoalEvent(ev: {
     goalPaused = true;
     goalStartedAt = null;
     showToast(ev.message?.trim() || tr("goal.blocked"), "error");
-  } else if (st === "cancelled" || st === "canceled") {
-    pendingGoalTitle = null;
-    activeGoalTitle = null;
-    userOptedInGoal = false;
-    goalPaused = false;
-    goalStartedAt = null;
-    goalElapsedFrozenMs = 0;
-    goalCompleted = false;
-    renderGoalBanner();
-    showToast(tr("goal.cancelledToast"));
-    return;
   } else {
-    // active 等
+    // active 等 — 仅 live 事件启动 wall-clock；有 elapsed_ms 时先冻结再续跑
     if (goalPaused) {
       goalStartedAt = Date.now();
     } else if (!goalStartedAt) {
+      // 有 agent 耗时：从「现在」续跑，冻结部分已记入 goalElapsedFrozenMs
       goalStartedAt = Date.now();
     }
     goalPaused = false;
@@ -5933,30 +6236,31 @@ function markGoalCompletedUi(message: string): void {
   showToast(message || tr("goal.completedToast"));
   if (goalCompleteHideTimer) clearTimeout(goalCompleteHideTimer);
   goalCompleteHideTimer = setTimeout(() => {
-    pendingGoalTitle = null;
-    activeGoalTitle = null;
-    userOptedInGoal = false;
-    goalCompleted = false;
-    goalElapsedFrozenMs = 0;
-    goalStartedAt = null;
-    goalPaused = false;
+    resetGoalUiState();
     renderGoalBanner();
   }, 8000);
 }
 
 async function pauseGoal(opts?: { fromStop?: boolean }): Promise<void> {
   if (!currentGoalTitle() || goalPaused || goalCompleted) return;
-  // 乐观更新；agent 经 /goal pause 与 goal_updated 最终确认
+  // Desktop 磁盘态为权威；冷会话 agent tracker 可能为 None
   goalElapsedFrozenMs = goalElapsedMsNow();
   goalStartedAt = null;
   goalPaused = true;
   if (activeSessionId) {
-    await inv("goals.setStatus", { sessionId: activeSessionId, status: "paused" });
+    await inv("goals.setStatus", {
+      sessionId: activeSessionId,
+      status: "paused",
+    });
   }
   renderGoalBanner();
-  showToast(opts?.fromStop ? "已停止并暂停目标" : "目标已暂停");
-  // 同源：通知 agent 暂停（CLI：/goal pause）
-  void sendAgentGoalSlash("/goal pause");
+  showToast(
+    opts?.fromStop ? tr("goal.pausedStop") : tr("goal.pausedToast"),
+  );
+  // 已 attach 时尽量通知 agent；失败不回滚 UI（避免 No goal is currently set 误伤）
+  if (activeThreadId && !activeThreadId.startsWith("disk_")) {
+    void sendAgentGoalSlash("/goal pause");
+  }
 }
 
 async function resumeGoal(): Promise<void> {
@@ -5965,10 +6269,14 @@ async function resumeGoal(): Promise<void> {
   goalCompleted = false;
   goalStartedAt = Date.now();
   if (activeSessionId) {
-    await inv("goals.setStatus", { sessionId: activeSessionId, status: "active" });
+    await inv("goals.setStatus", {
+      sessionId: activeSessionId,
+      status: "active",
+    });
   }
   renderGoalBanner();
-  showToast("目标已恢复");
+  showToast(tr("goal.resumedToast"));
+  // resume 需要 agent 真恢复编排：尽量 attach 后发送
   void sendAgentGoalSlash("/goal resume");
 }
 
@@ -6130,26 +6438,16 @@ async function runGoalCommand(
     return promptGoalBudget();
   }
   if (sub === "clear") {
-    pendingGoalTitle = null;
-    activeGoalTitle = null;
-    userOptedInGoal = false;
-    goalStartedAt = null;
-    goalElapsedFrozenMs = 0;
-    goalPaused = false;
-    goalCompleted = false;
     goalTokenBudget = null;
-    goalComposeActive = false;
-    setComposerPlaceholders(false);
-    if (goalCompleteHideTimer) {
-      clearTimeout(goalCompleteHideTimer);
-      goalCompleteHideTimer = null;
-    }
+    resetGoalUiState();
     if (activeSessionId) {
       await inv("goals.clear", { sessionId: activeSessionId });
     }
     renderGoalBanner();
-    // 同源：通知 agent 清除
-    void sendAgentGoalSlash("/goal clear");
+    // 同源：通知 agent 清除（已 attach 时）
+    if (activeThreadId && !activeThreadId.startsWith("disk_")) {
+      void sendAgentGoalSlash("/goal clear");
+    }
     return { ok: true, message: tr("goal.cleared") };
   }
   // set：不弹窗，聚焦输入框写目标
@@ -6229,11 +6527,7 @@ async function persistPendingGoal(): Promise<void> {
 async function refreshGoalChipFromSession(): Promise<void> {
   if (!activeSessionId) {
     if (!pendingGoalTitle && !goalCompleted && !goalComposeActive) {
-      activeGoalTitle = null;
-      userOptedInGoal = false;
-      goalStartedAt = null;
-      goalPaused = false;
-      goalElapsedFrozenMs = 0;
+      resetGoalUiState();
     }
     renderGoalBanner();
     return;
@@ -6246,34 +6540,46 @@ async function refreshGoalChipFromSession(): Promise<void> {
     sessionId: activeSessionId,
   });
   if (g.ok && g.data?.title) {
+    const st = String(g.data.status ?? "active").toLowerCase();
+    // cancelled / cleared：终态，不展示目标栏（修复旧会话假「进行中」）
+    if (st === "cancelled" || st === "canceled" || st === "cleared") {
+      resetGoalUiState();
+      // 顺带清脏 goal.json，避免反复误显
+      void inv("goals.clear", { sessionId: activeSessionId });
+      renderGoalBanner();
+      // 仍扫一次 agent log，兜底其它状态
+      void syncGoalFromAgent();
+      return;
+    }
     // 磁盘已有目标 = 用户曾主动设置（或历史会话）
     userOptedInGoal = true;
     // 已展示完成态时，不要被滞后的 active 磁盘状态打回
-    if (goalCompleted && g.data.status !== "completed") {
+    if (goalCompleted && st !== "completed") {
       renderGoalBanner();
       return;
     }
     activeGoalTitle = g.data.title;
-    if (g.data.status === "completed") {
+    if (st === "completed") {
       markGoalCompletedUi(g.data.title);
       return;
     }
-    goalPaused = g.data.status === "paused" || g.data.status === "blocked";
+    goalPaused = st === "paused" || st === "blocked";
+    goalCompleted = false;
     if (goalPaused) {
       goalStartedAt = null;
-    } else if (!goalStartedAt) {
-      const ts = g.data.updatedAt ? Date.parse(g.data.updatedAt) : NaN;
-      goalStartedAt = Number.isFinite(ts) ? ts : Date.now();
+      // 冷加载暂停：不伪造 wall-clock
+    } else {
+      // 冷加载 active：不要用 updatedAt 当起点（否则显示「已跑 N 天」）
+      // 等 live goal_updated / 用户 resume 再启动计时
+      goalStartedAt = null;
       goalElapsedFrozenMs = 0;
     }
   } else if (!pendingGoalTitle && !goalCompleted && !goalComposeActive) {
-    activeGoalTitle = null;
-    userOptedInGoal = false;
-    goalStartedAt = null;
-    goalPaused = false;
-    goalElapsedFrozenMs = 0;
+    resetGoalUiState();
   }
   renderGoalBanner();
+  // 打开会话后从 updates.jsonl 校准（cleared 会清 UI）
+  void syncGoalFromAgent();
 }
 
 /** 从 tool.completed raw 兜底识别 update_goal 完成 */
@@ -6988,6 +7294,8 @@ async function openThread(t: ThreadRow): Promise<void> {
     // S17：换会话重置 prompt 历史，稍后从磁盘 seed
     clearPromptHistoryStore();
     goalTokenBudget = null;
+    // 换会话先清上一会话 goal UI，再由 refresh 按磁盘恢复
+    resetGoalUiState();
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
@@ -7058,18 +7366,16 @@ async function openThread(t: ThreadRow): Promise<void> {
     if (!sameSession || !promptHistory.length) {
       seedPromptHistoryFromUserTexts(userTexts);
     }
-    // 与直播回合结束一致：过程块默认折叠（历史无精确耗时，不写「已处理」）
+    // 与直播回合结束一致：过程块默认折叠（历史无精确耗时，不写 Worked for）
     if (processBlockEl?.isConnected) {
       processBlockEl.classList.add("collapsed");
       const caret = processBlockEl.querySelector(".process-caret");
       if (caret) caret.textContent = "▸";
       updateProcessHeader();
     }
-    // 回放完成提示（条数）
+    // P0-A：已加载历史 + 空闲说明（非 Working，非 system 噪声行）
     const n = hist.data?.entries?.length ?? 0;
-    if (n > 0) {
-      appendLine(tr("history.replayDone", { n: String(n) }), "system");
-    }
+    paintHistoryReplayDone(n);
     await refreshProjectsAndThreads();
   } finally {
     suspendLiveTranscript = false;
@@ -7958,7 +8264,8 @@ function applyDesktopConfig(cfg: {
   // 只更新「新对话默认」；切换供应商等操作不得覆盖当前会话的权限模式 / 模型 chip
   defaultModelLabel = cfg.defaultModel || "grok";
   defaultOpenTarget = cfg.defaultOpenTarget;
-  if (cfg.locale !== undefined) {
+  // locale 仅在显式传入且相对当前有变化时刷 DOM（切换提供商不应带 locale）
+  if (cfg.locale !== undefined && cfg.locale !== localePreference) {
     localePreference = cfg.locale;
     const resolved = resolveLocale(cfg.locale, navigator.language);
     setLocale(resolved);
@@ -7968,7 +8275,7 @@ function applyDesktopConfig(cfg: {
     setComposerPlaceholders(goalComposeActive);
     syncModelLabels();
   }
-  if (cfg.theme !== undefined) {
+  if (cfg.theme !== undefined && cfg.theme !== themePreference) {
     applyThemePreference(cfg.theme);
   }
   if (!activeSessionId) {
@@ -7977,19 +8284,53 @@ function applyDesktopConfig(cfg: {
     applyDefaultToChip();
     syncPermLabels();
   }
-  // 供应商列表可能已变，清掉模型菜单缓存
+  // 供应商列表可能已变，清掉模型菜单缓存并校验当前 chip
   modelsCache = null;
   modelsFetch = null;
+  // 设置仍开着：只校准 chip，禁止 setModel / toast（关页时再补）
+  void ensureChipModelAvailable({
+    toast: Boolean(activeSessionId) && !isMainShellOverlayOpen(),
+    allowSetModel: !isMainShellOverlayOpen(),
+  });
 }
 
-/** 设置页关闭后恢复主界面可输入（焦点常卡在已隐藏的设置控件上） */
+/**
+ * 强制主壳可交互（防 settings-open / inert 粘住导致无法输入）。
+ * 插件全页仍可见时只清 settings 态，保留其 inert。
+ */
+function forceMainShellInteractive(): void {
+  const app = document.getElementById("app");
+  if (!app) return;
+  app.classList.remove("settings-open");
+  document.getElementById("settings-page")?.classList.add("hidden");
+  const plugins = document.getElementById("plugins-page");
+  const pluginsVisible = Boolean(
+    plugins && !plugins.classList.contains("hidden"),
+  );
+  if (pluginsVisible) return;
+  app.classList.remove("plugins-open");
+  app.removeAttribute("aria-hidden");
+  if ("inert" in app) {
+    (app as HTMLElement & { inert: boolean }).inert = false;
+  }
+}
+
+/** 设置/插件关闭后恢复主界面可输入 */
 function restoreComposerAfterOverlay(): void {
+  forceMainShellInteractive();
   hideModelMenu();
   $("perm-menu")?.classList.add("hidden");
-  // 双 rAF：等设置页 display:none 与 inert 解除后再抢焦点
+  // 设置期间推迟的模型校验：关页后再 setModel
+  void ensureChipModelAvailable({
+    toast: Boolean(activeSessionId),
+    allowSetModel: true,
+  });
+  // 双 rAF：等 display:none 与 inert 解除后再抢焦点
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       try {
+        forceMainShellInteractive();
+        if (isMainShellOverlayOpen()) return;
         const ta = activeComposerInput();
         if (!ta || ta.disabled || ta.readOnly) return;
         ta.focus({ preventScroll: true });
@@ -8942,6 +9283,7 @@ npm start</pre>
     syncContextLabels();
     setComposerPlaceholders(goalComposeActive);
     updateProcessHeader();
+    setComposerBusy(turnActive);
     renderGoalBanner();
     setWelcomeTitle();
     renderProjectPickerList(
