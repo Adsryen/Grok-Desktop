@@ -1288,6 +1288,14 @@ export class AcpClient {
       (params.toolCallId as string | undefined) ??
       (params.tool_call_id as string | undefined);
 
+    // 先登记 waiter 再发事件，避免同步自动响应路径找不到 requestId
+    const decisionPromise = new Promise<{
+      outcome: "approved" | "cancelled" | "abandoned";
+      feedback?: string;
+    }>((resolve) => {
+      this.planApprovalWaiters.set(requestId, { resolve });
+    });
+
     this.opts.onEvent({
       type: "plan.approval.requested",
       threadId: this.opts.threadId,
@@ -1304,12 +1312,7 @@ export class AcpClient {
       status: "needs_input",
     });
 
-    const decision = await new Promise<{
-      outcome: "approved" | "cancelled" | "abandoned";
-      feedback?: string;
-    }>((resolve) => {
-      this.planApprovalWaiters.set(requestId, { resolve });
-    });
+    const decision = await decisionPromise;
 
     // camelCase wire（对齐 ExitPlanModeExtResponse：outcome + optional feedback）
     try {
@@ -1352,6 +1355,12 @@ export class AcpClient {
       (toolCall?.kind as string) ??
       JSON.stringify(params).slice(0, 200);
 
+    // 必须先登记 waiter，再发 permission.requested：
+    // Host YOLO 在 onEvent 同步路径里 respondPermission，否则会 Unknown requestId 挂死 turn。
+    const optionIdPromise = new Promise<string>((resolve) => {
+      this.permissionWaiters.set(requestId, { resolve });
+    });
+
     this.opts.onEvent({
       type: "permission.requested",
       threadId: this.opts.threadId,
@@ -1367,9 +1376,7 @@ export class AcpClient {
       status: "needs_input",
     });
 
-    const optionId = await new Promise<string>((resolve) => {
-      this.permissionWaiters.set(requestId, { resolve });
-    });
+    const optionId = await optionIdPromise;
 
     this.respond(id, {
       outcome: { outcome: "selected", optionId },

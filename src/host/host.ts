@@ -1055,6 +1055,10 @@ export class DesktopHost {
     live.attachState = "history_only";
     live.thread.status = "inactive";
     live.thread.updatedAt = new Date().toISOString();
+    // 释放队列 drain 锁，避免 take 后未 complete 时永久卡死
+    if (live.thread.sessionId) {
+      this.releaseQueueDrainLock(live.thread.sessionId);
+    }
     this.emitAttachState(
       threadId,
       live.thread.sessionId,
@@ -1313,6 +1317,7 @@ export class DesktopHost {
     }
     this.sessionIndex.delete(ref.sessionId);
     this.attachInflight.delete(ref.sessionId);
+    this.releaseQueueDrainLock(ref.sessionId);
     deleteQueueFile(ref.sessionId, this.home);
 
     const sessionDir = findSessionDir(ref.sessionId, this.home);
@@ -3228,6 +3233,12 @@ export class DesktopHost {
     return next;
   }
 
+  /** 释放队列 drain 互斥（detach/delete/complete 共用） */
+  private releaseQueueDrainLock(sessionId: string): void {
+    const sid = sessionId.trim();
+    if (sid) this.queueDrainLocked.delete(sid);
+  }
+
   queueTakeNext(sessionId: string): {
     queue: PromptQueueFile;
     item: PromptQueueItem | null;
@@ -3261,7 +3272,7 @@ export class DesktopHost {
       this.emitQueueChanged(sid, "local", next);
       return next;
     } finally {
-      this.queueDrainLocked.delete(sid);
+      this.releaseQueueDrainLock(sid);
     }
   }
 

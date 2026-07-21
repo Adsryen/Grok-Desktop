@@ -105,14 +105,17 @@ describe("DesktopHost + ACP (shipped path)", () => {
     expect(statuses).toContain("idle");
   });
 
-  it("enforces SESSION_BUSY on double writable attach semantics", async () => {
+  it("threadsAttach is idempotent when already live (no SESSION_BUSY)", async () => {
     const host = makeHost();
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "grok-desktop-busy-"));
     const created = await host.threadsCreate({ cwd, prompt: "x" });
 
-    await expect(
-      host.threadsAttach(created.sessionId, cwd),
-    ).rejects.toMatchObject({ code: "SESSION_BUSY" });
+    // Mode B：ensureLive 可重复 attach；已 live 则返回同一 threadId（幂等）
+    const again = await host.threadsAttach(created.sessionId, cwd);
+    expect(again.threadId).toBe(created.threadId);
+    const ping = host.threadsPing(created.threadId);
+    expect(ping.ok).toBe(true);
+    expect(ping.alive).toBe(true);
   });
 
   it("returns structured HostError for missing binary", async () => {

@@ -261,14 +261,17 @@ export function takeNextPending(
   sessionId: string,
   home?: string,
 ): { queue: PromptQueueFile; item: PromptQueueItem | null } {
-  // 不恢复 orphan：进程内 Host 用 queueDrainLocked 互斥；
-  // 重启后由 loadQueue 默认 recover 把 sending→pending。
+  // 保留 sending 可见性；Host queueDrainLocked 保证进程内不双 take。
+  // 锁释放后（detach/崩溃恢复）允许重试 orphan sending。
   const q = loadQueue(sessionId, home, { recoverOrphanSending: false });
   if (q.pausedByInterrupt || !q.queueingEnabled) {
     return { queue: q, item: null };
   }
   const idx = q.items.findIndex(
-    (i) => i.status === "pending" || i.status === "failed",
+    (i) =>
+      i.status === "pending" ||
+      i.status === "failed" ||
+      i.status === "sending",
   );
   if (idx < 0) return { queue: q, item: null };
   const item: PromptQueueItem = {

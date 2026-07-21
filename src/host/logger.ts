@@ -16,11 +16,25 @@ export class HostLogger {
     return this.filePath;
   }
 
-  private ensureStream(): fs.WriteStream {
-    if (!this.stream) {
-      this.stream = fs.createWriteStream(this.filePath, { flags: "a" });
+  private ensureStream(): fs.WriteStream | null {
+    if (this.stream) return this.stream;
+    try {
+      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      const s = fs.createWriteStream(this.filePath, { flags: "a" });
+      // 测试 rm 掉 home 后异步 error 勿变成 uncaught
+      s.on("error", () => {
+        try {
+          s.destroy();
+        } catch {
+          /* ignore */
+        }
+        if (this.stream === s) this.stream = null;
+      });
+      this.stream = s;
+      return s;
+    } catch {
+      return null;
     }
-    return this.stream;
   }
 
   log(level: "info" | "warn" | "error" | "debug", message: string, extra?: unknown): void {
@@ -31,7 +45,7 @@ export class HostLogger {
       extra: extra === undefined ? undefined : extra,
     });
     try {
-      this.ensureStream().write(line + "\n");
+      this.ensureStream()?.write(line + "\n");
     } catch {
       // ignore disk errors in logger
     }
