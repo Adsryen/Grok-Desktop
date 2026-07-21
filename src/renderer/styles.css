@@ -3651,25 +3651,35 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
 .btw-ex-bubble-ai.btw-err {
   color: var(--danger, #a33);
 }
-/* 旁问底栏：与主对话 .chat-composer-wrap / .composer-card.compact 完全一致 */
+/* 旁问底栏：轻量输入（无附件/权限/计划/目标/可切换模型） */
 .btw-side-composer-wrap {
   flex-shrink: 0;
-  padding: 8px 12px 12px;
+  padding: 6px 12px 12px;
   background: var(--bg-card);
   border-top: 1px solid var(--border-soft);
   box-sizing: border-box;
+}
+.btw-side-hint {
+  margin: 0 0 6px;
+  padding: 0 2px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-3);
 }
 .btw-side-composer-wrap .composer-card,
 .btw-side-composer-card {
   width: 100%;
   box-sizing: border-box;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.1);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: visible;
-  padding-bottom: 10px;
+  padding-bottom: 8px;
+}
+.btw-side-composer-lite {
+  border-radius: 12px;
 }
 .btw-side-composer-wrap .composer-card textarea,
 .btw-side-composer-card textarea {
@@ -3681,15 +3691,26 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
   field-sizing: content;
   color: var(--text);
 }
-.btw-side-composer-wrap .composer-toolbar {
+.btw-side-toolbar-lite {
   flex: 0 0 auto;
   min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   overflow: visible;
 }
-.btw-side-composer-wrap .attach-chips {
-  flex: 0 0 auto;
-  max-height: 72px;
-  overflow-y: auto;
+.btw-side-model-ro {
+  display: inline-block;
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-3);
+  opacity: 0.9;
+  cursor: default;
+  user-select: none;
 }
 
 /* 旧主时间线 btw 卡片（若历史 DOM 残留） */
@@ -6055,4 +6076,21 @@ dialog input {
   height: 6px;
   border-radius: 50%;
   background: #3b82f6;
+}
+/* 计划轨：有 plan / 修订中 / 待批准 */
+.side-cat-btn.has-activity-soft::after {
+  background: #94a3b8;
+}
+.side-cat-btn.has-activity-revising::after {
+  background: #e6a817;
+  animation: plan-rail-pulse 1.2s ease-in-out infinite;
+}
+.side-cat-btn.has-activity-pending::after {
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.25);
+  animation: plan-rail-pulse 1s ease-in-out infinite;
+}
+@keyframes plan-rail-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }

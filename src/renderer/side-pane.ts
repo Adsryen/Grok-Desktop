@@ -152,16 +152,20 @@ export class SidePaneController {
   /** 全屏展开侧栏（聊天区隐藏，底部悬浮输入） */
   private focusMode = false;
   private onFocusModeChange?: (focus: boolean) => void;
+  /** 用户点轨上「计划」时加载 plan 内容（由 main 注入，避免循环依赖） */
+  private onSelectPlan?: () => void;
   constructor(opts: {
     inv: Inv;
     getCwd: () => string | null;
     getSessionId?: () => string | null;
     onFocusModeChange?: (focus: boolean) => void;
+    onSelectPlan?: () => void;
   }) {
     this.inv = opts.inv;
     this.getCwd = opts.getCwd;
     this.getSessionId = opts.getSessionId ?? (() => null);
     this.onFocusModeChange = opts.onFocusModeChange;
+    this.onSelectPlan = opts.onSelectPlan;
     this.restorePrefs();
     this.bindChrome();
     this.applyOpenState(false);
@@ -229,6 +233,39 @@ export class SidePaneController {
     if (cat === "files") void this.refreshFileTree();
     else void this.syncFileWatch();
     if (cat === "agents") void this.refreshAgentsTree();
+    if (cat === "plan") this.onSelectPlan?.();
+  }
+
+  /**
+   * 计划轨活动点：none | soft（有 plan）| revising | pending（待批准，最醒目）
+   */
+  setPlanRailActivity(
+    level: "none" | "soft" | "revising" | "pending",
+  ): void {
+    const btn = document.getElementById("btn-cat-plan");
+    if (!btn) return;
+    btn.classList.remove(
+      "has-activity",
+      "has-activity-soft",
+      "has-activity-revising",
+      "has-activity-pending",
+    );
+    if (level === "none") return;
+    btn.classList.add("has-activity");
+    if (level === "soft") btn.classList.add("has-activity-soft");
+    if (level === "revising") btn.classList.add("has-activity-revising");
+    if (level === "pending") btn.classList.add("has-activity-pending");
+    const titleBase = tr("side.plan");
+    if (level === "pending") {
+      btn.title = tr("side.planRailPending") || `${titleBase} · 待批准`;
+    } else if (level === "revising") {
+      btn.title = tr("side.planRailRevising") || `${titleBase} · 修订中`;
+    } else if (level === "soft") {
+      btn.title = tr("side.planRailActive") || `${titleBase} · 计划模式`;
+    } else {
+      btn.title = titleBase;
+    }
+    btn.setAttribute("aria-label", btn.title);
   }
 
   /**
@@ -581,6 +618,7 @@ export class SidePaneController {
         if (cat === "agents") {
           document.getElementById("btn-cat-agents")?.classList.remove("has-activity");
         }
+        // plan 点选后保留徽章（待批准仍需可见）；不在此清除
       };
     }
 

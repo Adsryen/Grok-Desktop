@@ -43,3 +43,12 @@ export function attachPillI18nKey(kind: AttachPillKind): string {
 export function attachPillCssClass(kind: AttachPillKind): string {
   return `attach-pill attach-pill--${kind}`;
 }
+
+/**
+ * 方案 B：composer 不常驻附着态。
+ * 仅「连接中 / 断开中 / 失败」短暂展示；仅历史 / 已连接不占位。
+ * 发送路径 ensureLiveThread 自动 attach，无需用户点「连接 Agent」。
+ */
+export function attachPillShouldShow(kind: AttachPillKind): boolean {
+  return kind === "attaching" || kind === "detaching" || kind === "failed";
+}

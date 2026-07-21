@@ -6,6 +6,7 @@
  */
 import type { HostIpcMethod } from "../shared/host-api.js";
 import type { NormalizedEvent } from "../shared/events.js";
+import { matchFriendlyErrorTitleKey } from "../shared/friendly-error-title.js";
 import {
   applyDomI18n,
   onLocaleChange,
@@ -66,10 +67,12 @@ import {
 } from "./fork-session-ui.js";
 import {
   hostClearQueue,
+  hostCompleteSending,
   hostEnqueue,
   hostRemoveItem,
   hostReorder,
   hostSetQueueFlags,
+  hostTakeNext,
   hostUpdateItem,
   loadSessionQueue,
   mirrorQueueToLocal,
@@ -168,6 +171,11 @@ const THREADS_PREVIEW_LIMIT = 5;
 /** 用户是否手动选过项目 /「不使用项目」（避免 refresh 强制回填首项） */
 let projectChoiceTouched = false;
 let activeThreadId: string | null = null;
+/**
+ * 会话视图代次：openThread / 切会话时递增。
+ * await history/attach 返回后若 gen 已变，丢弃结果，防止串台。
+ */
+let sessionViewGen = 0;
 let activeSessionId: string | null = null;
 let activeCwd: string | null = null;
 /** 写入 activeCwd 并通知侧栏文件树重监听 */
@@ -207,6 +215,11 @@ let pendingPlanApproval: {
  * endTurn 后短窗口内仍接受本 turn 的 assistant 流，避免「会话断了、最后一泡没了」。
  */
 let lateStreamUntil = 0;
+/**
+ * 同一 turn 内错误只展示一次：turn.completed(error) 与 turns.prompt IPC 失败
+ * 会先后带同一条 Internal error（#6 起双路径都画红条）。
+ */
+let lastShownTurnError: { turnId: number; key: string } | null = null;
 /** 本 turn 内 agent 写入的类 plan 文档路径（非 session plan.md 时兜底展示） */
 let lastPlanArtifactPath: string | null = null;
 /** 计划面板：磁盘已保存内容（用于脏检测） */
@@ -799,6 +812,77 @@ function normalizeAssistantForDedupe(s: string): string {
     .toLowerCase();
 }
 
+/** 把 agent/provider 错误收成短友好标题（无操作建议） */
+function formatTurnErrorMessage(
+  message: string | undefined,
+  details?: unknown,
+): string {
+  const raw = (message ?? "").trim() || "";
+  const tryMsg = (v: unknown): string | null => {
+    if (typeof v === "string" && v.trim()) return v.trim();
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>;
+      if (typeof o.message === "string" && o.message.trim()) return o.message.trim();
+      if (o.data != null) return tryMsg(o.data);
+    }
+    return null;
+  };
+  let detail: string | null = null;
+  const brace = raw.indexOf("{");
+  if (brace >= 0) {
+    try {
+      detail = tryMsg(JSON.parse(raw.slice(brace)));
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!detail && details != null) detail = tryMsg(details);
+
+  const haystack = [raw, detail].filter(Boolean).join("\n");
+  const key = matchFriendlyErrorTitleKey(haystack);
+  if (key) return tr(key);
+
+  // 未映射：取首行短标题，去掉 Internal error 外壳
+  let line = (detail || raw || tr("err.internal")).split(/\r?\n/)[0]?.trim() || tr("err.internal");
+  line = line.replace(/^internal error:\s*/i, "").trim() || tr("err.internal");
+  if (line.length > 80) line = line.slice(0, 80) + "…";
+  return line;
+}
+
+/** 本 turn 错误红条去重：turn.completed 与 turns.prompt 失败常成对，只画一条 */
+function showTurnErrorOnce(
+  message: string | undefined,
+  details?: unknown,
+): void {
+  const text = formatTurnErrorMessage(message, details);
+  const key = normalizeAssistantForDedupe(text).slice(0, 120) || text;
+  if (lastShownTurnError && lastShownTurnError.turnId === currentTurnId) {
+    return;
+  }
+  lastShownTurnError = { turnId: currentTurnId, key };
+  appendLine(text, "error");
+}
+
+/**
+ * 流式文案与 history 落盘文案常有细微差别（标点/少字/末句改写）。
+ * 用于去重：相同、互相包含、或共同前缀足够长则视为同一条。
+ */
+function assistantTextsRoughlyEqual(a: string, b: string): boolean {
+  const na = normalizeAssistantForDedupe(a);
+  const nb = normalizeAssistantForDedupe(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer = na.length <= nb.length ? nb : na;
+  if (shorter.length < 12) return false;
+  if (longer.includes(shorter)) return true;
+  let i = 0;
+  const lim = Math.min(shorter.length, longer.length);
+  while (i < lim && shorter[i] === longer[i]) i += 1;
+  // 至少 40 字相同，或覆盖较短文案 70%
+  return i >= 40 || i >= Math.floor(shorter.length * 0.7);
+}
+
 /** 同一 turn 内避免 agent 重复推送几乎相同的主回复 */
 function findDedupeAssistantBubble(
   turnId: number,
@@ -816,17 +900,7 @@ function findDedupeAssistantBubble(
     if (n.dataset.turnId && n.dataset.turnId !== String(turnId)) continue;
     const prev = (n.dataset.raw ?? n.textContent ?? "").trim();
     if (!prev) continue;
-    const prevN = normalizeAssistantForDedupe(prev);
-    if (!prevN) continue;
-    // 相同 / 互相包含 / 高度重叠 → 复用气泡
-    if (
-      nextN === prevN ||
-      nextN.startsWith(prevN) ||
-      prevN.startsWith(nextN) ||
-      (nextN.length > 40 &&
-        prevN.length > 40 &&
-        (nextN.includes(prevN.slice(0, 40)) || prevN.includes(nextN.slice(0, 40))))
-    ) {
+    if (assistantTextsRoughlyEqual(nextRaw, prev)) {
       return n;
     }
   }
@@ -1247,14 +1321,53 @@ function scheduleDrainPromptQueue(): void {
 async function drainPromptQueue(): Promise<void> {
   if (turnActive) return;
   if (queuePausedByInterrupt) return;
-  const next = promptQueue.shift();
-  if (!next) {
+  const sid = activeSessionId;
+  if (!sid) {
+    // 无会话：仅本地队列（极少路径）
+    const next = promptQueue.shift();
+    if (!next) {
+      syncPromptQueueBar();
+      return;
+    }
     syncPromptQueueBar();
+    await dispatchAgentPrompt(next.content, next.display, { force: false });
     return;
   }
-  syncPromptQueueBar();
-  // dispatchAgentPrompt 会 paintUserMessage(display)
-  await dispatchAgentPrompt(next.content, next.display, { force: false });
+  // L1 权威：take → 发送 → complete（勿只 shift 内存，否则磁盘项会复活）
+  const taken = await hostTakeNext(inv, sid);
+  if (!taken?.item) {
+    if (taken?.queue) applyHostQueueMirror(taken.queue);
+    else syncPromptQueueBar();
+    return;
+  }
+  // take 期间用户可能已切会话：回 pending 语义用 failed 保留，勿静默删除
+  if (activeSessionId !== sid) {
+    await hostCompleteSending(
+      inv,
+      sid,
+      taken.item.id,
+      false,
+      "session switched during queue drain",
+    );
+    return;
+  }
+  applyHostQueueMirror(taken.queue);
+  const item = taken.item;
+  const result = await dispatchAgentPrompt(item.content, item.display, {
+    force: false,
+  });
+  // 仅当仍在原会话时镜像 UI；complete 始终写回原 sid 的 L1
+  await hostCompleteSending(
+    inv,
+    sid,
+    item.id,
+    result.ok,
+    result.ok ? undefined : result.error,
+  );
+  if (activeSessionId === sid) {
+    const file = await loadSessionQueue(inv, sid);
+    applyHostQueueMirror(file);
+  }
 }
 
 function showPromptQueueModal(): { ok: boolean; message?: string } {
@@ -1951,6 +2064,7 @@ function beginTurn(): void {
   currentTurnId += 1;
   streamTurnId = currentTurnId;
   assistantStartedThisTurn = false;
+  lastShownTurnError = null;
   thoughtBlockEl = null;
   thoughtBodyEl = null;
   processBlockEl = null;
@@ -2370,14 +2484,14 @@ function appendLine(
       scrollTranscript();
       return;
     }
-    // 仅合并「紧邻上一条」完全相同的助手气泡（流式定稿重复推送），
-    // 禁止跨轮/全文扫描去重：两次相同回复（如两个「好的」）必须各占一泡。
+    // 仅合并「紧邻上一条」实质相同的助手气泡（history 回补 vs 流式定稿）。
+    // 禁止跨轮全文扫描：两轮各回「好的」仍应各占一泡。
     const last = el.lastElementChild as HTMLElement | null;
-    if (
-      last?.classList.contains("assistant") &&
-      (last.dataset.raw ?? last.textContent ?? "").trim() === trimmed
-    ) {
-      return;
+    if (last?.classList.contains("assistant")) {
+      const prev = (last.dataset.raw ?? last.textContent ?? "").trim();
+      if (prev && assistantTextsRoughlyEqual(trimmed, prev)) {
+        return;
+      }
     }
     resetStreamState(true);
     const div = document.createElement("div");
@@ -2826,7 +2940,7 @@ function permLabel(): string {
 
 function syncPermLabels(): void {
   const v = permLabel();
-  for (const id of ["perm-label", "perm-label-2", "perm-label-btw"] as const) {
+  for (const id of ["perm-label", "perm-label-2"] as const) {
     const el = document.getElementById(id);
     if (el) el.textContent = v;
   }
@@ -2863,7 +2977,7 @@ function modelChipText(): string {
 
 function syncModelLabels(): void {
   const v = modelChipText();
-  for (const id of ["model-label", "model-label-2", "model-label-btw"] as const) {
+  for (const id of ["model-label", "model-label-2"] as const) {
     const el = document.getElementById(id);
     if (el) el.textContent = v;
   }
@@ -2872,7 +2986,7 @@ function syncModelLabels(): void {
     display !== (modelLabel || "").trim()
       ? `${display} (${modelLabel})`
       : display;
-  for (const id of ["btn-model", "btn-model-2", "btn-model-btw"] as const) {
+  for (const id of ["btn-model", "btn-model-2"] as const) {
     const btn = document.getElementById(id);
     if (btn) {
       btn.title = tr("chat.modelTitle", {
@@ -2881,6 +2995,13 @@ function syncModelLabels(): void {
         level: effortLevel,
       });
     }
+  }
+  // 侧问栏：只读展示主会话模型（无切换）
+  const btwRo = document.getElementById("btw-model-readonly");
+  if (btwRo) {
+    btwRo.textContent = v;
+    btwRo.title = tr("btw.modelReadonlyTitle", { model: modelForTitle }) ||
+      `与主会话相同：${modelForTitle}`;
   }
 }
 
@@ -3206,29 +3327,27 @@ async function startFreshSessionWithModel(
   if (!cwd) {
     return { ok: false, message: tr("model.needProject") };
   }
-  if (turnActive) void cancelTurn();
-  clearPromptQueue({ silent: true });
+  // 先干净离开旧 live（保持项目 cwd 选中），再 create 空会话
+  const keepProjectId = selectedProjectId;
+  const keepCwd = cwd;
+  await leaveCurrentSessionToWelcome({ clearQueue: true });
+  if (keepProjectId) selectedProjectId = keepProjectId;
+  setActiveCwd(keepCwd);
   clearPromptHistoryStore();
 
   setModelId(modelId);
   setEffortLevel(effort);
-
-  // 离开当前会话（不删除磁盘历史）
-  closePlanPanelOnSessionChange();
-  activeThreadId = null;
-  activeSessionId = null;
-  endTurn({ skipQueueDrain: true });
-  clearTranscript();
-  showWelcome(false);
   setWelcomeTitle();
+  showWelcome(false);
+  clearTranscript();
 
   const res = await inv<{
     threadId: string;
     sessionId: string;
     cwd: string;
   }>("threads.create", {
-    cwd,
-    projectId: p?.id,
+    cwd: keepCwd,
+    projectId: keepProjectId ?? p?.id,
     title: `新会话 · ${shortModelName(modelId)}`.slice(0, 48),
     model: modelId,
     effort,
@@ -3731,14 +3850,14 @@ function syncSessionModeChips(): void {
   // /goal 进入编写态即显示 chip，发送后仍显示
   const goalOn = Boolean(goalTitle) || goalComposeActive;
 
-  for (const id of ["chip-plan", "chip-plan-2", "chip-plan-btw"] as const) {
+  for (const id of ["chip-plan", "chip-plan-2"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
     el.classList.toggle("hidden", !planOn);
     el.title = planOn ? tr("plan.modeChipOpen") : tr("plan.modeChip");
   }
   syncPlanPanelChrome();
-  for (const id of ["chip-goal", "chip-goal-2", "chip-goal-btw"] as const) {
+  for (const id of ["chip-goal", "chip-goal-2"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
     el.classList.toggle("hidden", !goalOn);
@@ -3872,6 +3991,7 @@ function closePlanPanelOnSessionChange(): void {
   if (fb) fb.value = "";
   sidePane?.closePlanCategory();
   syncPlanPanelChrome();
+  syncPlanRailActivity();
 }
 
 function planEditorEl(): HTMLTextAreaElement | null {
@@ -3934,6 +4054,34 @@ function syncPlanPanelChrome(): void {
   prev?.classList.toggle("hidden", showSource || !hasBody);
   // 预览模式下禁用保存焦点在编辑器；保存仍可用（写当前 draft）
   if (ed) ed.readOnly = !showSource;
+  syncPlanRailActivity();
+}
+
+/** 右侧轨「计划」活动点：待批准 > 修订中 > 计划模式/有内容 */
+function syncPlanRailActivity(): void {
+  if (!sidePane) return;
+  const ed = planEditorEl();
+  const hasBody = Boolean((ed?.value ?? "").trim() || planPanelPath);
+  if (pendingPlanApproval) {
+    sidePane.setPlanRailActivity("pending");
+    return;
+  }
+  const turn =
+    document.querySelector(".turn-status")?.textContent ??
+    document.getElementById("turn-status")?.textContent ??
+    "";
+  if (
+    isPlanOn() &&
+    (turn.includes(tr("plan.revising")) || /修订|revis/i.test(turn))
+  ) {
+    sidePane.setPlanRailActivity("revising");
+    return;
+  }
+  if (isPlanOn() || hasBody) {
+    sidePane.setPlanRailActivity("soft");
+    return;
+  }
+  sidePane.setPlanRailActivity("none");
 }
 
 /** 按当前 viewMode 刷新预览 DOM（从 editor 读源码） */
@@ -4230,22 +4378,32 @@ async function respondPlanPanel(
       showToast(tr("plan.abandonToast"));
       appendLine(tr("plan.abandonLine"), "system");
     } else {
-      // cancelled = 要求修改：保持 plan + accessMode
+      // cancelled = 要求修改：保持 plan + accessMode；计划面板不关（方案 A）
       planPhase = "active";
       syncPermLabels();
       setPlanPanelBusy(false);
+      // 主时间线可见「要求修改 + 意见」（RPC feedback 不会自动画用户泡）
+      const reviseDisplay = feedback
+        ? `${tr("plan.reviseUser")}\n${feedback}`
+        : tr("plan.reviseUser");
+      showWelcome(false);
+      sidePane?.openPlanCategory();
+      syncPlanPanelChrome();
 
       if (requestId) {
         // reverse-RPC 已把 cancelled+feedback 交回 agent，本回合会 Continue。
         // 切勿再 session/prompt，否则会与进行中回合冲突 → Internal error。
+        paintUserMessage(reviseDisplay);
         showToast(feedback ? tr("plan.reviseToastFb") : tr("plan.reviseToast"));
         setTurnStatus(tr("plan.revising"));
+        syncPlanRailActivity();
       } else {
         const revPrompt = feedback
           ? `请根据以下意见修改计划（仍在计划模式：更新 plan.md，不要改业务代码）。我已直接编辑了 plan.md，请在其基础上修订：\n${feedback}`
           : `请根据我已编辑的 plan.md 继续完善计划（仍在计划模式：只更新 plan.md，不要改业务代码）。补充风险、验收标准与可落地步骤。`;
         showToast(tr("plan.reviseStartToast"));
-        await dispatchAgentPrompt(revPrompt, tr("plan.reviseUser"), { force: true });
+        // dispatch 会 paint 用户泡；display 含意见正文
+        await dispatchAgentPrompt(revPrompt, reviseDisplay, { force: true });
       }
     }
   } catch (err) {
@@ -4291,17 +4449,26 @@ async function afterTurnSettled(): Promise<void> {
 
 async function resyncMissingAssistantFromHistory(): Promise<void> {
   if (!activeSessionId) return;
+  /**
+   * 新对话直播路径：本 turn 已流式画出助手回复时，禁止再从 history 回补。
+   * 磁盘落盘文案常与流式略有出入（如「现在想做什么」vs「你现在想做什么」），
+   * 旧去重会漏判 → 「已完成」下方再贴一整条重复气泡。
+   */
+  if (assistantStartedThisTurn) return;
+
+  const wantSession = activeSessionId;
+  const viewGen = sessionViewGen;
   const hist = await inv<{
     entries: Array<{ role: string; text: string }>;
-  }>("history.load", { sessionId: activeSessionId });
+  }>("history.load", { sessionId: wantSession });
+  if (viewGen !== sessionViewGen || activeSessionId !== wantSession) return;
   if (!hist.ok || !hist.data?.entries?.length) return;
 
-  const shown = Array.from(
+  const shownNodes = Array.from(
     $("transcript").querySelectorAll(".line.assistant"),
-  ).map((n) =>
-    normalizeAssistantForDedupe(
-      ((n as HTMLElement).dataset.raw ?? n.textContent ?? "").trim(),
-    ),
+  ) as HTMLElement[];
+  const shownRaws = shownNodes.map((n) =>
+    (n.dataset.raw ?? n.textContent ?? "").trim(),
   );
 
   for (const e of hist.data.entries) {
@@ -4310,15 +4477,10 @@ async function resyncMissingAssistantFromHistory(): Promise<void> {
     if (!text || text.length < 8) continue;
     const n = normalizeAssistantForDedupe(text);
     if (!n || n.length < 12) continue;
-    const exists = shown.some(
-      (s) =>
-        s === n ||
-        (n.length > 40 && s.includes(n.slice(0, 40))) ||
-        (s.length > 40 && n.includes(s.slice(0, 40))),
-    );
+    const exists = shownRaws.some((s) => assistantTextsRoughlyEqual(text, s));
     if (exists) continue;
     appendLine(text, "assistant");
-    shown.push(n);
+    shownRaws.push(text);
   }
 }
 
@@ -4395,21 +4557,18 @@ async function maybeSurfacePlanAfterTurn(): Promise<void> {
 }
 
 /**
- * 系统代发一条用户消息并跑一轮（计划批准 / 要求修改）。
- * display 进时间线；content 发给 agent。
- */
-/**
  * 系统代发一条用户消息并跑一轮。
  * force：计划批准等场景下若 UI 仍标 turnActive（exit_plan 挂起/事件乱序），先 endTurn 再发。
+ * @returns 是否已成功提交到 agent（队列 L1 complete 依赖此值）
  */
 async function dispatchAgentPrompt(
   content: string,
   display?: string,
   opts?: { force?: boolean },
-): Promise<void> {
+): Promise<{ ok: boolean; error?: string }> {
   const shown = (display ?? content).trim();
   const agentText = content.trim();
-  if (!agentText) return;
+  if (!agentText) return { ok: false, error: "empty" };
 
   if (turnActive) {
     if (opts?.force) {
@@ -4418,7 +4577,7 @@ async function dispatchAgentPrompt(
       endTurn({ skipQueueDrain: true });
     } else {
       showToast(tr("chat.turnBusy"), "error");
-      return;
+      return { ok: false, error: tr("chat.turnBusy") };
     }
   }
 
@@ -4431,7 +4590,7 @@ async function dispatchAgentPrompt(
   if (!threadId) {
     endTurn();
     appendLine(tr("chat.connectFail"), "error");
-    return;
+    return { ok: false, error: tr("chat.connectFail") };
   }
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   setTurnStatus(tr("turn.thinking"));
@@ -4441,12 +4600,22 @@ async function dispatchAgentPrompt(
   });
   if (!res.ok) {
     endTurn();
-    appendLine(res.error?.message ?? tr("chat.sendFail"), "error");
-  } else {
-    scheduleTurnSettle(currentTurnId);
+    // turn.completed(error) 可能已画过同一条；去重
+    const errMsg = res.error?.message ?? tr("chat.sendFail");
+    showTurnErrorOnce(
+      errMsg,
+      res.error && "details" in res.error
+        ? (res.error as { details?: unknown }).details
+        : undefined,
+    );
+    void refreshContextUsage();
+    void refreshProjectsAndThreads();
+    return { ok: false, error: errMsg };
   }
+  scheduleTurnSettle(currentTurnId);
   void refreshContextUsage();
   void refreshProjectsAndThreads();
+  return { ok: true };
 }
 
 function bindSessionModeChips(): void {
@@ -4473,14 +4642,14 @@ function bindSessionModeChips(): void {
       }
       return;
     }
-    const planChip = t.closest("#chip-plan, #chip-plan-2, #chip-plan-btw");
+    const planChip = t.closest("#chip-plan, #chip-plan-2");
     if (planChip && !t.closest("[data-chip-close]")) {
       void showViewPlan().then((r) => {
         if (!r.ok && r.message) showToast(r.message, "error");
       });
       return;
     }
-    const goalChip = t.closest("#chip-goal, #chip-goal-2, #chip-goal-btw");
+    const goalChip = t.closest("#chip-goal, #chip-goal-2");
     if (goalChip && !t.closest("[data-chip-close]")) {
       void runGoalCommand("status");
     }
@@ -5965,11 +6134,7 @@ function openComposerImagePreview(a: ComposerAttachment): void {
 }
 
 function renderAttachmentChips(): void {
-  for (const id of [
-    "composer-attachments",
-    "chat-attachments",
-    "btw-attachments",
-  ] as const) {
+  for (const id of ["composer-attachments", "chat-attachments"] as const) {
     const el = document.getElementById(id);
     if (!el) continue;
     if (!composerAttachments.length) {
@@ -6954,12 +7119,7 @@ function showPlusMenu(anchor: HTMLElement): void {
 }
 
 function bindPlusMenu(): void {
-  for (const id of [
-    "btn-attach",
-    "btn-attach-chat",
-    "btn-focus-attach",
-    "btn-attach-btw",
-  ] as const) {
+  for (const id of ["btn-attach", "btn-attach-chat", "btn-focus-attach"] as const) {
     const btn = document.getElementById(id);
     if (!btn) continue;
     btn.addEventListener("click", (e) => {
@@ -6996,9 +7156,7 @@ function bindPlusMenu(): void {
   document.addEventListener("click", (e) => {
     const t = e.target as HTMLElement;
     if (
-      !t.closest(
-        "#plus-menu, #btn-attach, #btn-attach-chat, #btn-focus-attach, #btn-attach-btw",
-      )
+      !t.closest("#plus-menu, #btn-attach, #btn-attach-chat, #btn-focus-attach")
     ) {
       hidePlusMenu();
     }
@@ -7121,21 +7279,80 @@ function isThreadOpen(t: ThreadRow): boolean {
   );
 }
 
-/** 若归档/删除的是当前会话，退回欢迎页 */
-function leaveThreadIfOpen(t: ThreadRow): void {
-  if (!isThreadOpen(t)) return;
-  endTurn();
+function isLiveThreadId(id: string | null | undefined): id is string {
+  return Boolean(id && !id.startsWith("disk_"));
+}
+
+/**
+ * 离开当前会话 → 欢迎页。
+ * 产品约定：此处不 threads.create；用户在欢迎页输入并发送后才 startNewChat。
+ * 必须：停 turn、detach live agent、清本地指针，避免旧会话事件/忙态粘在欢迎页。
+ */
+async function leaveCurrentSessionToWelcome(opts?: {
+  /** 默认 true：离开会话时清空本地 follow-up 队列 */
+  clearQueue?: boolean;
+}): Promise<void> {
+  const clearQueue = opts?.clearQueue !== false;
+  const prevLiveId = isLiveThreadId(activeThreadId) ? activeThreadId : null;
+
+  if (turnActive) {
+    await cancelTurn({ clearQueue });
+  } else if (clearQueue) {
+    clearPromptQueue({ silent: true });
+  }
+
+  // cancel 失败或竞态时仍强制 UI 空闲
+  if (turnActive) {
+    endTurn({ skipQueueDrain: true, outcome: "stopped" });
+  }
+
+  if (prevLiveId) {
+    const det = await inv("threads.detach", { threadId: prevLiveId });
+    if (!det.ok) {
+      // 会话可能已死；不挡回欢迎页
+      console.warn("[leaveSession] detach failed", det.error?.message);
+    }
+  }
+
   closePlanPanelOnSessionChange();
+  sessionViewGen += 1;
   activeThreadId = null;
   activeSessionId = null;
   setActiveCwd(null);
-  clearTranscript();
-  showWelcome(true);
-  setWelcomeTitle();
   applyDefaultToChip();
   stopContextPolling();
   lastContextUsage = null;
   syncContextLabels();
+  lateStreamUntil = 0;
+  suspendLiveTranscript = false;
+  hideAgentCrashBanner();
+
+  if (!goalComposeActive) {
+    pendingGoalTitle = null;
+    activeGoalTitle = null;
+    userOptedInGoal = false;
+    goalStartedAt = null;
+    goalElapsedFrozenMs = 0;
+    goalPaused = false;
+    goalCompleted = false;
+  }
+
+  clearTranscript();
+  resetStreamState(false);
+  endTurn({ skipQueueDrain: true });
+  setComposerBusy(false);
+  attachUiState = "history_only";
+  syncAttachPill();
+  showWelcome(true);
+  setWelcomeTitle();
+  renderGoalBanner();
+  void refreshProjectsAndThreads();
+}
+
+/** 若归档/删除的是当前会话，退回欢迎页 */
+function leaveThreadIfOpen(t: ThreadRow): void {
+  if (!isThreadOpen(t)) return;
+  void leaveCurrentSessionToWelcome({ clearQueue: true });
 }
 
 async function archiveThread(t: ThreadRow, archived: boolean): Promise<void> {
@@ -7595,6 +7812,7 @@ async function continueRecentSession(): Promise<void> {
 async function openThread(t: ThreadRow): Promise<void> {
   // 加载 history 期间挂起直播事件，避免与磁盘回放叠双份
   suspendLiveTranscript = true;
+  const viewGen = ++sessionViewGen;
   endTurn(); // 切换会话时清理进行中 UI
   hideAgentCrashBanner();
   agentAvailableCommands = [];
@@ -7611,10 +7829,21 @@ async function openThread(t: ThreadRow): Promise<void> {
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
-  // 默认 history_only；发送时再 attach（P1-B 懒附着）
-  setAttachUiState(
-    t.id.startsWith("disk_") || !t.id ? "history_only" : "history_only",
-  );
+  // 默认 history_only；若已有 live 附着则同步 pill（仍懒附着发送路径）
+  setAttachUiState("history_only");
+  if (t.id && !t.id.startsWith("disk_")) {
+    void inv<{
+      state?: string;
+      lastError?: string;
+    }>("threads.attachState", { threadId: t.id }).then((st) => {
+      if (viewGen !== sessionViewGen) return;
+      if (!st.ok || !st.data?.state) return;
+      const s = st.data.state as AttachState;
+      if (s === "live" || s === "attaching" || s === "failed") {
+        setAttachUiState(s, st.data.lastError);
+      }
+    });
+  }
   // L1 按会话加载持久队列（勿静默清空）
   void reloadPromptQueueFromHost();
   setActiveCwd(t.cwd);
@@ -7648,6 +7877,8 @@ async function openThread(t: ThreadRow): Promise<void> {
         toolOutput?: unknown;
       }>;
     }>("history.load", { sessionId: t.sessionId });
+    // 快速切换：丢弃过期回放，避免画进错误会话
+    if (viewGen !== sessionViewGen) return;
     const userTexts: string[] = [];
     // S15：连贯回放 — user / thought / tool / assistant 同一时间线
     for (const e of hist.data?.entries ?? []) {
@@ -7696,7 +7927,9 @@ async function openThread(t: ThreadRow): Promise<void> {
     paintHistoryReplayDone(n);
     await refreshProjectsAndThreads();
   } finally {
-    suspendLiveTranscript = false;
+    if (viewGen === sessionViewGen) {
+      suspendLiveTranscript = false;
+    }
   }
 }
 
@@ -7723,64 +7956,117 @@ function replayHistoryTool(e: {
   markToolCompleted(id, name, rawOut);
 }
 
+/**
+ * 将 chip 上的 model/effort 同步到 live agent。
+ * attach/load 后 session 磁盘模型可能与 UI 不一致，发送前再校准一次。
+ */
+async function syncLiveSessionModel(threadId: string): Promise<void> {
+  const id = (modelLabel || "").trim();
+  if (!id || threadId.startsWith("disk_")) return;
+  const r = await inv("threads.setModel", {
+    threadId,
+    modelId: id,
+    effort: effortLevel,
+  });
+  if (!r.ok) {
+    console.warn(
+      "[syncLiveSessionModel]",
+      r.error?.message ?? "setModel failed",
+      id,
+    );
+  }
+}
+
 /** Disk session → attach live ACP so turns.prompt works. Ping if already live. */
 async function ensureLiveThread(): Promise<string | null> {
   if (!activeSessionId || !activeCwd) return null;
+  const wantSession = activeSessionId;
+  const wantCwd = activeCwd;
+  const viewGen = sessionViewGen;
   if (activeThreadId && !activeThreadId.startsWith("disk_")) {
     const ping = await inv<{ ok: boolean; alive: boolean; state: string }>(
       "threads.ping",
       { threadId: activeThreadId },
     );
+    if (viewGen !== sessionViewGen || activeSessionId !== wantSession) {
+      return null;
+    }
     if (ping.ok && ping.data?.ok && ping.data.alive) {
       setAttachUiState("live");
+      await syncLiveSessionModel(activeThreadId);
       return activeThreadId;
     }
-    // stale live id → force reattach
-    setAttachUiState("failed", ping.error?.message ?? tr("crash.default"));
+    // stale live id → force reattach（发送路径自动重连，不要求用户先点）
     activeThreadId = `disk_${activeSessionId}`;
   }
   setAttachUiState("attaching");
+  // 发送/续聊时：状态条提示连接，不依赖 composer 常驻 pill
+  if (turnActive) {
+    setTurnStatus(tr("attach.connectingStatus") || "正在连接 Agent…");
+  }
   // R3：attach 期挂起直播，避免与已回放历史叠双份（Mode B 无 load live buffer）
   suspendLiveTranscript = true;
   try {
     const att = await inv<{ threadId: string }>("threads.attach", {
-      sessionId: activeSessionId,
-      cwd: activeCwd,
+      sessionId: wantSession,
+      cwd: wantCwd,
     });
+    // 切会话后勿把旧 attach 结果绑到当前 UI
+    if (viewGen !== sessionViewGen || activeSessionId !== wantSession) {
+      return null;
+    }
     if (!att.ok || !att.data?.threadId) {
-      appendLine(att.error?.message ?? tr("crash.attachFail"), "error");
-      setAttachUiState("failed", att.error?.message);
-      showAgentCrashBanner(att.error?.message);
+      const msg = att.error?.message ?? tr("crash.attachFail");
+      showTurnErrorOnce(msg);
+      setAttachUiState("failed", msg);
+      showAgentCrashBanner(msg);
       return null;
     }
     activeThreadId = att.data.threadId;
     setAttachUiState("live");
     hideAgentCrashBanner();
+    // Host attach 已按 meta setModel；再用 chip 校准（用户可能已改 chip 未落盘）
+    await syncLiveSessionModel(activeThreadId);
+    if (viewGen !== sessionViewGen || activeSessionId !== wantSession) {
+      return null;
+    }
+    if (turnActive) {
+      setTurnStatus(tr("turn.thinking"));
+    }
     // attach 后刷新 agent 广告命令
     void refreshAgentAvailableCommands().then(() => slashPalette?.invalidate());
     return activeThreadId;
   } finally {
-    suspendLiveTranscript = false;
+    if (viewGen === sessionViewGen) {
+      suspendLiveTranscript = false;
+    }
   }
 }
 
 function setAttachUiState(state: AttachState, lastError?: string): void {
   attachUiState = state;
   syncAttachPill(lastError);
-  if (state === "failed" && lastError) {
-    showAgentCrashBanner(lastError);
+  if (state === "failed") {
+    showAgentCrashBanner(lastError || tr("crash.default"));
   }
 }
 
 function syncAttachPill(lastError?: string): void {
-  syncAttachPillDom(attachUiState, lastError, {
-    onConnectClick: () => {
-      void connectAgentWarm();
+  // 方案 B：无会话强制藏；有会话时仅 attaching/detaching/failed 由 DOM 层决定是否显示
+  const forceHide = !activeSessionId && !activeThreadId;
+  syncAttachPillDom(
+    attachUiState,
+    lastError,
+    {
+      onConnectClick: () => {
+        void connectAgentWarm();
+      },
     },
-  });
+    forceHide,
+  );
 }
 
-/** 用户主动连接 Agent（不发送消息） */
+/** 失败态 / 崩溃条：手动重连（主路径仍是发送时 ensureLiveThread 自动 attach） */
 async function connectAgentWarm(): Promise<void> {
   if (!activeSessionId) {
     showToast(tr("crash.needSession"), "error");
@@ -7789,8 +8075,12 @@ async function connectAgentWarm(): Promise<void> {
   if (activeThreadId && !activeThreadId.startsWith("disk_")) {
     activeThreadId = `disk_${activeSessionId}`;
   }
+  setTurnStatus(tr("attach.connectingStatus") || "正在连接 Agent…");
   const tid = await ensureLiveThread();
-  if (tid) showToast(tr("attach.connectedToast"));
+  if (tid) {
+    showToast(tr("attach.connectedToast"));
+    removeTurnStatus();
+  }
 }
 
 async function pickAndAddProject(): Promise<Project | null> {
@@ -7897,10 +8187,27 @@ async function startNewChat(prompt?: string): Promise<void> {
   }
   const attachSnap = [...composerAttachments];
   const { display, content } = buildPromptWithAttachments(goalParse.message);
-  if (!content.trim()) return;
+  if (!content.trim()) {
+    showToast(
+      tr("chat.needFirstMessage") || "请输入第一条消息以开始新对话",
+      "info",
+    );
+    return;
+  }
   // 新会话：重置历史后再记本条
   clearPromptHistoryStore();
   recordPromptHistory(display || content);
+
+  // 若仍挂着旧 live（未点「新对话」或 leave 失败），先 detach 再 create
+  if (isLiveThreadId(activeThreadId) || activeSessionId) {
+    const prevLive = isLiveThreadId(activeThreadId) ? activeThreadId : null;
+    if (turnActive) await cancelTurn({ clearQueue: true });
+    if (prevLive) {
+      await inv("threads.detach", { threadId: prevLive });
+    }
+    activeThreadId = null;
+    activeSessionId = null;
+  }
 
   // 立刻反馈，不把整轮 prompt 塞进 create（否则要等整轮结束才返回，首字极慢）
   showWelcome(false);
@@ -7971,7 +8278,12 @@ async function startNewChat(prompt?: string): Promise<void> {
   });
   if (!pr.ok) {
     endTurn();
-    appendLine(pr.error?.message ?? tr("chat.sendFail"), "error");
+    showTurnErrorOnce(
+      pr.error?.message ?? tr("chat.sendFail"),
+      pr.error && "details" in pr.error
+        ? (pr.error as { details?: unknown }).details
+        : undefined,
+    );
   } else {
     // 正常结束靠 turn.completed；invoke 与事件乱序时延迟兜底 + 回补末包
     scheduleTurnSettle(currentTurnId);
@@ -8185,7 +8497,12 @@ async function sendBtwQuestion(
     question: q,
   });
   if (!res.ok) {
-    const msg = res.error?.message ?? tr("btw.fail");
+    const msg = formatTurnErrorMessage(
+      res.error?.message ?? tr("btw.fail"),
+      res.error && "details" in res.error
+        ? (res.error as { details?: unknown }).details
+        : undefined,
+    );
     paintBtwExchange(q, "error", msg, exId);
     return { ok: false, message: msg };
   }
@@ -8374,7 +8691,12 @@ async function sendContinue(): Promise<void> {
   });
   if (!res.ok) {
     endTurn();
-    appendLine(res.error?.message ?? tr("chat.sendFail"), "error");
+    showTurnErrorOnce(
+      res.error?.message ?? tr("chat.sendFail"),
+      res.error && "details" in res.error
+        ? (res.error as { details?: unknown }).details
+        : undefined,
+    );
   } else {
     // 正常结束靠 turn.completed；勿在此立刻 endTurn（会丢末包）
     scheduleTurnSettle(currentTurnId);
@@ -9218,6 +9540,46 @@ function handleShellNotice(code: string, message?: string): void {
   }
 }
 
+/** 会写入当前 transcript / 改 turn UI 的事件（必须按会话隔离） */
+function isTranscriptScopedEvent(ev: { type?: string }): boolean {
+  switch (ev.type) {
+    case "message.delta":
+    case "thought.delta":
+    case "tool.started":
+    case "tool.completed":
+    case "turn.started":
+    case "turn.completed":
+    case "permission.requested":
+    case "context.compacted":
+    case "agent.error":
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * 事件是否属于当前打开的会话。
+ * - 优先 sessionId（disk_* / live 均可靠）
+ * - 无 sessionId 时回退 threadId（仅 live id 可比；disk_ 前缀不相等）
+ */
+function eventBelongsToActiveSession(ev: {
+  sessionId?: string;
+  threadId?: string;
+}): boolean {
+  if (!activeSessionId && !activeThreadId) return false;
+  if (ev.sessionId) {
+    return Boolean(activeSessionId && ev.sessionId === activeSessionId);
+  }
+  if (ev.threadId && activeThreadId) {
+    if (ev.threadId === activeThreadId) return true;
+    // live thread 事件 vs 当前 disk_ 展示：若 session 未知则拒绝（防串台）
+    if (activeThreadId.startsWith("disk_")) return false;
+  }
+  // 无 session/thread 标识的全局事件不走此函数
+  return !ev.sessionId && !ev.threadId;
+}
+
 function onEvent(raw: unknown): void {
   const ev = raw as NormalizedEvent & { activity?: string };
   // Dedicated shell control bus (preferred over session.status activity)
@@ -9235,6 +9597,18 @@ function onEvent(raw: unknown): void {
       (ev as { message?: string }).message,
     );
     return;
+  }
+  /**
+   * 欢迎页（无活动会话）：丢弃带 thread/session 的直播事件。
+   * 旧 agent 在 detach 前后仍可能吐 delta/error，否则会污染新对话入口。
+   */
+  if (!activeThreadId && !activeSessionId) {
+    const tid = "threadId" in ev ? (ev as { threadId?: string }).threadId : undefined;
+    const sid =
+      "sessionId" in ev ? (ev as { sessionId?: string }).sessionId : undefined;
+    if (tid || sid) {
+      return;
+    }
   }
   // goal 与 agent 同源：不因 transcript 挂起而丢状态
   if (ev.type === "goal.updated") {
@@ -9332,19 +9706,17 @@ function onEvent(raw: unknown): void {
     }
     return;
   }
-  // Ignore events for other threads when we have an active one
-  if (
-    "threadId" in ev &&
-    ev.threadId &&
-    activeThreadId &&
-    ev.threadId !== activeThreadId &&
-    !activeThreadId.startsWith("disk_")
-  ) {
+  // Transcript / turn 事件：按 sessionId 严格隔离（含 disk_* 浏览态）
+  // 旧逻辑在 activeThreadId=disk_* 时跳过 thread 过滤 → 后台 live 会话会污染当前页
+  if (isTranscriptScopedEvent(ev) && !eventBelongsToActiveSession(ev)) {
     return;
   }
   // create / openThread 期间丢弃直播，避免与 history 叠双份
   if (suspendLiveTranscript) {
-    if (ev.type === "permission.requested") {
+    if (
+      ev.type === "permission.requested" &&
+      eventBelongsToActiveSession(ev)
+    ) {
       showPermission(ev.requestId, ev.summary);
     }
     return;
@@ -9390,14 +9762,11 @@ function onEvent(raw: unknown): void {
       const hadText = Boolean((ev as { hadAssistantText?: boolean }).hadAssistantText);
       const hadTools = Boolean((ev as { hadToolActivity?: boolean }).hadToolActivity);
       endTurn();
+      // 超时/错误：只走友好标题；与 turns.prompt 失败共用 showTurnErrorOnce 去重
       if (stop === "timeout" || /timed out/i.test(errMsg)) {
-        appendLine(
-          tr("chat.turnTimeout") ||
-            "Turn timed out (agent idle too long). Try again or split the task.",
-          "error",
-        );
+        showTurnErrorOnce(errMsg || "timeout");
       } else if (errMsg && stop === "error") {
-        appendLine(errMsg, "error");
+        showTurnErrorOnce(errMsg);
       } else if (!hadText && !hadTools) {
         appendLine(
           tr("chat.turnEmpty") ||
@@ -9450,7 +9819,7 @@ function onEvent(raw: unknown): void {
       break;
     case "agent.error":
       endTurn();
-      appendLine(ev.message, "error");
+      showTurnErrorOnce(ev.message);
       // R4：标记 live 失效，展示重新附着
       if (activeThreadId && !activeThreadId.startsWith("disk_") && activeSessionId) {
         activeThreadId = `disk_${activeSessionId}`;
@@ -9538,9 +9907,15 @@ npm start</pre>
         requestAnimationFrame(() => fi.focus());
       }
     },
-    // 计划不进分类轨；仅 /view-plan · chip · exit_plan 打开
+    // 轨上点「计划」→ 加载 plan 内容（与 chip / /view-plan 同源）
+    onSelectPlan: () => {
+      void showViewPlan().then((r) => {
+        if (!r.ok && r.message) showToast(r.message, "error");
+      });
+    },
   });
   bindPlanPanel();
+  syncPlanRailActivity();
   bindCodeCopyDelegate($("transcript"));
   bindFileLinkDelegate($("transcript"), async (filePath, line) => {
     // Codex：点路径 → 侧栏预览（非默认外开）
@@ -9595,7 +9970,7 @@ npm start</pre>
   renderAttachmentChips();
   renderGoalBanner();
 
-  for (const id of ["btn-model", "btn-model-2", "btn-model-btw"] as const) {
+  for (const id of ["btn-model", "btn-model-2"] as const) {
     const btn = document.getElementById(id);
     if (!btn) continue;
     btn.onclick = (e) => {
@@ -9611,7 +9986,7 @@ npm start</pre>
   }
   document.addEventListener("mousedown", (e) => {
     const t = e.target as HTMLElement;
-    if (!t.closest("#model-menu, #btn-model, #btn-model-2, #btn-model-btw")) {
+    if (!t.closest("#model-menu, #btn-model, #btn-model-2")) {
       hideModelMenu();
     }
   });
@@ -9621,29 +9996,10 @@ npm start</pre>
     void continueRecentSession();
   };
   $("btn-new-chat").onclick = () => {
-    if (turnActive) void cancelTurn();
-    closePlanPanelOnSessionChange();
-    activeThreadId = null;
-    activeSessionId = null;
-    setActiveCwd(null);
-    // 新对话：chip 回到默认模型，不沿用上一会话
-    applyDefaultToChip();
-    stopContextPolling();
-    lastContextUsage = null;
-    syncContextLabels();
-    // 新对话清会话目标条；compose 中的草稿不跨对话保留
-    if (!goalComposeActive) {
-      pendingGoalTitle = null;
-      activeGoalTitle = null;
-      userOptedInGoal = false;
-      goalStartedAt = null;
-      goalElapsedFrozenMs = 0;
-      goalPaused = false;
-    }
-    endTurn();
-    showWelcome(true);
-    renderGoalBanner();
-    ($("composer-input") as HTMLTextAreaElement).focus();
+    // 产品：只回欢迎页，发送第一条消息时再 threads.create
+    void leaveCurrentSessionToWelcome({ clearQueue: true }).then(() => {
+      ($("composer-input") as HTMLTextAreaElement).focus();
+    });
   };
 
   $("btn-context").onclick = () => {
@@ -9835,13 +10191,11 @@ npm start</pre>
   };
   $("btn-perm-mode").onclick = () => showPermMenu($("btn-perm-mode"));
   $("btn-perm-mode-2").onclick = () => showPermMenu($("btn-perm-mode-2"));
-  const permBtw = document.getElementById("btn-perm-mode-btw");
-  if (permBtw) permBtw.onclick = () => showPermMenu(permBtw);
   document.addEventListener("click", (e) => {
     if (!isPermMenuVisible()) return;
     if (
       !(e.target as HTMLElement).closest(
-        "#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-perm-mode-btw, #btn-sandbox-setup",
+        "#perm-menu, #btn-perm-mode, #btn-perm-mode-2, #btn-sandbox-setup",
       )
     ) {
       hidePermMenu();

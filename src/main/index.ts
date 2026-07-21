@@ -536,6 +536,17 @@ async function handleHostIpc(
           syncError: p.syncError as string | null | undefined,
         }),
       );
+    case "queue.takeNext":
+      return resultOk(host.queueTakeNext(String(p.sessionId ?? "")));
+    case "queue.completeSending":
+      return resultOk(
+        host.queueCompleteSending(
+          String(p.sessionId ?? ""),
+          String(p.itemId ?? ""),
+          p.ok !== false,
+          p.error as string | undefined,
+        ),
+      );
     case "hooks.list":
       return resultOk(host.hooksList());
     case "hooks.trust":

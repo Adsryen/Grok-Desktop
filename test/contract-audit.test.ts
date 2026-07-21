@@ -81,6 +81,24 @@ describe("contract audit", () => {
     expect(renderer).toMatch(/shell\.handoff/);
   });
 
+  it("session isolation: event filter + view gen + queue L1 drain", () => {
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/sessionViewGen/);
+    expect(renderer).toMatch(/eventBelongsToActiveSession/);
+    expect(renderer).toMatch(/isTranscriptScopedEvent/);
+    expect(renderer).toMatch(/hostTakeNext/);
+    expect(renderer).toMatch(/hostCompleteSending/);
+    const api = read("src/shared/host-api.ts");
+    expect(api).toMatch(/queue\.takeNext/);
+    expect(api).toMatch(/queue\.completeSending/);
+    const main = read("src/main/index.ts");
+    expect(main).toMatch(/queue\.takeNext/);
+    expect(main).toMatch(/queue\.completeSending/);
+    const host = read("src/host/host.ts");
+    expect(host).toMatch(/attachInflight/);
+    expect(host).toMatch(/deleteQueueFile/);
+  });
+
   it("Host API product vocabulary and errors", () => {
     const host = read("src/host/host.ts");
     expect(host).toMatch(/threadsCreate/);

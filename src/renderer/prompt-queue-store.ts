@@ -116,6 +116,35 @@ export async function hostSetQueueFlags(
   return res.ok && res.data ? res.data : null;
 }
 
+/** L1：取出下一条 pending/failed 并标为 sending */
+export async function hostTakeNext(
+  inv: Inv,
+  sessionId: string,
+): Promise<{ queue: HostQueueFile; item: HostQueueItem | null } | null> {
+  const res = await inv<{ queue: HostQueueFile; item: HostQueueItem | null }>(
+    "queue.takeNext",
+    { sessionId },
+  );
+  return res.ok && res.data ? res.data : null;
+}
+
+/** L1：发送完成（ok 删除；失败标 failed） */
+export async function hostCompleteSending(
+  inv: Inv,
+  sessionId: string,
+  itemId: string,
+  ok: boolean,
+  error?: string,
+): Promise<HostQueueFile | null> {
+  const res = await inv<HostQueueFile>("queue.completeSending", {
+    sessionId,
+    itemId,
+    ok,
+    error,
+  });
+  return res.ok && res.data ? res.data : null;
+}
+
 export function mirrorQueueToLocal(
   file: HostQueueFile | null,
 ): {

@@ -32,6 +32,58 @@ export interface AcpClientOptions {
   allowFs?: boolean;
 }
 
+/** 从 agent Internal error 包装里抽出可读原因（API 400 / 空 tool name 等） */
+function enrichAcpErrorMessage(
+  message: string | undefined,
+  data: unknown,
+): string {
+  const raw = (message ?? "").trim() || "ACP error";
+  const tryParseObject = (s: string): Record<string, unknown> | null => {
+    const start = s.indexOf("{");
+    const end = s.lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    try {
+      return JSON.parse(s.slice(start, end + 1)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  };
+  const pickMessage = (obj: Record<string, unknown> | null): string | null => {
+    if (!obj) return null;
+    const m = obj.message ?? obj.error_message ?? obj.error;
+    if (typeof m === "string" && m.trim()) return m.trim();
+    if (m && typeof m === "object" && "message" in (m as object)) {
+      const inner = (m as { message?: unknown }).message;
+      if (typeof inner === "string" && inner.trim()) return inner.trim();
+    }
+    return null;
+  };
+
+  let detail = pickMessage(tryParseObject(raw));
+  if (!detail && data != null) {
+    if (typeof data === "string") detail = pickMessage(tryParseObject(data));
+    else if (typeof data === "object") {
+      detail = pickMessage(data as Record<string, unknown>);
+      if (!detail && "data" in (data as object)) {
+        const nested = (data as { data?: unknown }).data;
+        if (typeof nested === "string") detail = pickMessage(tryParseObject(nested));
+        else if (nested && typeof nested === "object") {
+          detail = pickMessage(nested as Record<string, unknown>);
+        }
+      }
+    }
+  }
+
+  if (detail && detail !== raw) {
+    // 已是完整句子则直接用；否则挂在 Internal error 后
+    if (/^internal error/i.test(raw) || raw === "ACP error") return detail;
+    if (!raw.includes(detail.slice(0, Math.min(40, detail.length)))) {
+      return `${raw}: ${detail}`;
+    }
+  }
+  return raw;
+}
+
 /**
  * JSON-RPC over stdio ACP client — the real path used by Desktop Host.
  */
@@ -1096,11 +1148,13 @@ export class AcpClient {
           data?: unknown;
           code?: number | string;
         };
+        // Agent 常把真实原因塞进 data / message 内嵌 JSON，勿只留下 "Internal error"
+        const rich = enrichAcpErrorMessage(err.message, err.data ?? msg.error);
         // 透传 data（如 MODEL_SWITCH_INCOMPATIBLE_AGENT），供 UI 对齐 CLI 新会话确认
         pending.reject(
           new HostError(
             "INTERNAL",
-            err.message ?? "ACP error",
+            rich,
             err.data !== undefined
               ? { code: err.code, message: err.message, data: err.data }
               : msg.error,

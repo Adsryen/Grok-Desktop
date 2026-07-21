@@ -181,6 +181,7 @@ import { listDesktopHooks, setHookTrusted } from "./hooks-trust.js";
 import {
   clearQueue,
   completeSending,
+  deleteQueueFile,
   enqueueItem,
   loadQueue,
   removeItem,
@@ -250,6 +251,10 @@ export class DesktopHost {
   private readonly home?: string;
   private threads = new Map<string, LiveThread>();
   private sessionIndex = new Map<string, string>();
+  /** sessionId → in-flight attach Promise（去重并发 attach，避免双进程） */
+  private attachInflight = new Map<string, Promise<{ threadId: string }>>();
+  /** 队列 drain 互斥：take→complete 之间禁止二次 take */
+  private queueDrainLocked = new Set<string>();
   private listeners = new Set<EventListener>();
   private single: SingleInstanceHandle | null = null;
   private disposed = false;
@@ -832,6 +837,11 @@ export class DesktopHost {
       return { threadId, sessionId, cwd, worktreeId };
     } catch (err) {
       await client.close().catch(() => undefined);
+      // session/new 成功后失败：清索引，避免幽灵 sessionIndex → 死 threadId
+      const sid = thread.sessionId;
+      if (sid && this.sessionIndex.get(sid) === threadId) {
+        this.sessionIndex.delete(sid);
+      }
       this.threads.delete(threadId);
       throw this.wrap(err);
     }
@@ -842,22 +852,42 @@ export class DesktopHost {
     cwd: string,
   ): Promise<{ threadId: string }> {
     this.assertNotDisposed();
+    const sid = sessionId.trim();
+    if (!sid) {
+      throw new HostError("INVALID_ARGUMENT", "sessionId required");
+    }
+    // 并发 attach 去重：同一 session 共用 in-flight Promise
+    const inflight = this.attachInflight.get(sid);
+    if (inflight) return inflight;
+
+    const run = this.threadsAttachImpl(sid, cwd).finally(() => {
+      if (this.attachInflight.get(sid) === run) {
+        this.attachInflight.delete(sid);
+      }
+    });
+    this.attachInflight.set(sid, run);
+    return run;
+  }
+
+  private async threadsAttachImpl(
+    sessionId: string,
+    cwd: string,
+  ): Promise<{ threadId: string }> {
     const existingThreadId = this.sessionIndex.get(sessionId);
     if (existingThreadId) {
       const live = this.threads.get(existingThreadId);
-      if (live?.writable && live.client) {
-        throw new HostError(
-          "SESSION_BUSY",
-          `Thread already has a writable attach: ${existingThreadId}`,
-        );
+      if (live?.writable && live.client?.isAlive()) {
+        return { threadId: existingThreadId };
       }
     }
     for (const [tid, live] of this.threads) {
-      if (live.thread.sessionId === sessionId && live.writable && live.client) {
-        throw new HostError(
-          "SESSION_BUSY",
-          `Session already attached by thread ${tid}`,
-        );
+      if (
+        live.thread.sessionId === sessionId &&
+        live.writable &&
+        live.client?.isAlive()
+      ) {
+        this.sessionIndex.set(sessionId, tid);
+        return { threadId: tid };
       }
     }
 
@@ -903,6 +933,12 @@ export class DesktopHost {
     thread.model = resolvedModel;
     if (smeta.effort) thread.effort = smeta.effort;
 
+    // 覆盖旧 client 前先关掉，避免双进程孤儿
+    const prev = this.threads.get(threadId);
+    if (prev?.client && prev.client !== client) {
+      await prev.client.close().catch(() => undefined);
+    }
+
     this.threads.set(threadId, {
       thread,
       client,
@@ -919,6 +955,23 @@ export class DesktopHost {
       await client.start();
       this.runtimeCaps = { ...this.runtimeCaps, ...client.capabilities };
       await client.loadSession({ sessionId, cwd: resolvedCwd });
+      // loadSession 会恢复磁盘上的 current_model_id；必须再 setModel，
+      // 否则 UI/thread-meta 与 agent 实际采样模型不一致（如 meta=g2-grok-4.5
+      // 而 session 仍是 grok-4.5 → 打到错误提供商 → 间歇性 INVALID_API_KEY）。
+      if (resolvedModel) {
+        try {
+          await client.setModel(resolvedModel, {
+            effort: smeta.effort,
+          });
+          thread.model = resolvedModel;
+        } catch (err) {
+          this.logger.warn("threads.attach_set_model_failed", {
+            sessionId,
+            modelId: resolvedModel,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       thread.sessionId = sessionId;
       thread.updatedAt = new Date().toISOString();
       thread.status = "idle";
@@ -931,7 +984,11 @@ export class DesktopHost {
       }
       this.emitAttachState(threadId, sessionId, "live");
       await this.enforceLiveAttachBudget();
-      this.logger.info("threads.attach", { threadId, sessionId });
+      this.logger.info("threads.attach", {
+        threadId,
+        sessionId,
+        modelId: resolvedModel,
+      });
       return { threadId };
     } catch (err) {
       await client.close().catch(() => undefined);
@@ -1229,6 +1286,8 @@ export class DesktopHost {
       }
     }
     this.sessionIndex.delete(ref.sessionId);
+    this.attachInflight.delete(ref.sessionId);
+    deleteQueueFile(ref.sessionId, this.home);
 
     const sessionDir = findSessionDir(ref.sessionId, this.home);
     if (sessionDir) {
@@ -2985,9 +3044,9 @@ export class DesktopHost {
               t.phase === "running",
           ),
         ),
-        hasSendingQueueItem: loadQueue(live.thread.sessionId, this.home).items.some(
-          (i) => i.status === "sending",
-        ),
+        hasSendingQueueItem: loadQueue(live.thread.sessionId, this.home, {
+          recoverOrphanSending: false,
+        }).items.some((i) => i.status === "sending"),
       });
     }
     return out;
@@ -3096,7 +3155,21 @@ export class DesktopHost {
     queue: PromptQueueFile;
     item: PromptQueueItem | null;
   } {
-    return takeNextPending(sessionId, this.home);
+    const sid = sessionId.trim();
+    if (!sid) {
+      return { queue: loadQueue("", this.home), item: null };
+    }
+    // 同一 session 已有 in-flight drain：不二次 take（防重复发送）
+    if (this.queueDrainLocked.has(sid)) {
+      return {
+        queue: loadQueue(sid, this.home, { recoverOrphanSending: false }),
+        item: null,
+      };
+    }
+    const result = takeNextPending(sid, this.home);
+    if (result.item) this.queueDrainLocked.add(sid);
+    this.emitQueueChanged(sid, "local", result.queue);
+    return result;
   }
 
   queueCompleteSending(
@@ -3105,9 +3178,14 @@ export class DesktopHost {
     ok: boolean,
     error?: string,
   ): PromptQueueFile {
-    const next = completeSending(sessionId, itemId, ok, error, this.home);
-    this.emitQueueChanged(sessionId, "local", next);
-    return next;
+    const sid = sessionId.trim();
+    try {
+      const next = completeSending(sid, itemId, ok, error, this.home);
+      this.emitQueueChanged(sid, "local", next);
+      return next;
+    } finally {
+      this.queueDrainLocked.delete(sid);
+    }
   }
 
   private emitQueueChanged(

@@ -77,6 +77,8 @@ export type HostIpcMethod =
   | "queue.update"
   | "queue.clear"
   | "queue.setFlags"
+  | "queue.takeNext"
+  | "queue.completeSending"
   | "hooks.list"
   | "hooks.trust"
   | "hooks.untrust"

@@ -34,11 +34,15 @@ import {
 } from "../src/host/normalize.js";
 import {
   clearQueue,
+  completeSending,
+  deleteQueueFile,
   enqueueItem,
   loadQueue,
+  queueFilePath,
   reorderItems,
   saveQueue,
   setQueueFlags,
+  takeNextPending,
 } from "../src/host/prompt-queue.js";
 import { findSessionDir } from "../src/host/paths.js";
 import { aggregateTasksLoose } from "../src/host/tasks-aggregate.js";
@@ -545,5 +549,101 @@ describe("saveQueue roundtrip", () => {
     );
     expect(q.version).toBe(1);
     expect(loadQueue("round", home).items[0]?.id).toBe("q1");
+  });
+
+  it("takeNext + completeSending L1 lifecycle", () => {
+    const home = tempHome();
+    enqueueItem("s-drain", { display: "a", content: "msg-a", attachments: [] }, home);
+    enqueueItem("s-drain", { display: "b", content: "msg-b", attachments: [] }, home);
+    const taken = takeNextPending("s-drain", home);
+    expect(taken.item?.content).toBe("msg-a");
+    expect(taken.item?.status).toBe("sending");
+    // 磁盘保留 sending（idle-detach 探测）
+    const raw = loadQueue("s-drain", home, { recoverOrphanSending: false });
+    expect(raw.items[0]?.status).toBe("sending");
+    // 普通 load 恢复 orphan sending → pending（防卡死）
+    expect(loadQueue("s-drain", home).items[0]?.status).toBe("pending");
+
+    const afterOk = completeSending("s-drain", taken.item!.id, true, undefined, home);
+    expect(afterOk.items.map((i) => i.content)).toEqual(["msg-b"]);
+
+    const t2 = takeNextPending("s-drain", home);
+    const afterFail = completeSending(
+      "s-drain",
+      t2.item!.id,
+      false,
+      "boom",
+      home,
+    );
+    expect(afterFail.items).toHaveLength(1);
+    expect(afterFail.items[0]?.status).toBe("failed");
+    expect(afterFail.items[0]?.lastError).toBe("boom");
+  });
+
+  it("deleteQueueFile removes L1 file", () => {
+    const home = tempHome();
+    enqueueItem("s-del", { display: "x", content: "x", attachments: [] }, home);
+    const p = queueFilePath("s-del", home);
+    expect(fs.existsSync(p)).toBe(true);
+    deleteQueueFile("s-del", home);
+    expect(fs.existsSync(p)).toBe(false);
+  });
+
+  it("atomic save uses rename (no leftover tmp after success)", () => {
+    const home = tempHome();
+    saveQueue(
+      {
+        version: 1,
+        sessionId: "atom",
+        updatedAt: new Date().toISOString(),
+        queueingEnabled: true,
+        pausedByInterrupt: false,
+        items: [],
+      },
+      home,
+    );
+    const p = queueFilePath("atom", home);
+    expect(fs.existsSync(p)).toBe(true);
+    expect(fs.existsSync(p + ".tmp")).toBe(false);
+  });
+});
+
+describe("threadsAttach inflight + queue cleanup on delete", () => {
+  it("concurrent attach same session returns same threadId", async () => {
+    const home = tempHome();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cwd-att-"));
+    homes.push(cwd);
+    const host = trackHost(
+      new DesktopHost({
+        home,
+        grokPath: process.execPath,
+        agentArgs: [fakeAgent],
+      }),
+    );
+    const created = await host.threadsCreate({ cwd, title: "att" });
+    await host.threadsDetach(created.threadId);
+    const [a, b] = await Promise.all([
+      host.threadsAttach(created.sessionId, cwd),
+      host.threadsAttach(created.sessionId, cwd),
+    ]);
+    expect(a.threadId).toBe(b.threadId);
+  });
+
+  it("threadsDelete removes queue file", async () => {
+    const home = tempHome();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cwd-delq-"));
+    homes.push(cwd);
+    const host = trackHost(
+      new DesktopHost({
+        home,
+        grokPath: process.execPath,
+        agentArgs: [fakeAgent],
+      }),
+    );
+    const created = await host.threadsCreate({ cwd, title: "qdel" });
+    host.queueEnqueue(created.sessionId, { content: "stay" });
+    expect(fs.existsSync(queueFilePath(created.sessionId, home))).toBe(true);
+    await host.threadsDelete(created.threadId);
+    expect(fs.existsSync(queueFilePath(created.sessionId, home))).toBe(false);
   });
 });

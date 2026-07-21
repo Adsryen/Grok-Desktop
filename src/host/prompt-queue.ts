@@ -55,10 +55,19 @@ export function emptyQueue(sessionId: string): PromptQueueFile {
   };
 }
 
-export function loadQueue(sessionId: string, home?: string): PromptQueueFile {
+/**
+ * @param recoverOrphanSending 默认 true：load 时把崩溃残留的 sending 改回 pending。
+ *   idle-detach 探测「正在发送」时传 false。
+ */
+export function loadQueue(
+  sessionId: string,
+  home?: string,
+  opts?: { recoverOrphanSending?: boolean },
+): PromptQueueFile {
   const sid = sessionId.trim();
   if (!sid) return emptyQueue("");
   const p = queueFilePath(sid, home);
+  const recover = opts?.recoverOrphanSending !== false;
   try {
     if (!fs.existsSync(p)) return emptyQueue(sid);
     const raw = JSON.parse(fs.readFileSync(p, "utf8")) as PromptQueueFile;
@@ -69,7 +78,9 @@ export function loadQueue(sessionId: string, home?: string): PromptQueueFile {
       updatedAt: raw.updatedAt || new Date().toISOString(),
       queueingEnabled: raw.queueingEnabled !== false,
       pausedByInterrupt: Boolean(raw.pausedByInterrupt),
-      items: Array.isArray(raw.items) ? raw.items.map(normalizeItem) : [],
+      items: Array.isArray(raw.items)
+        ? raw.items.map((it) => normalizeItem(it, { recoverOrphanSending: recover }))
+        : [],
       syncError: raw.syncError ?? null,
     };
   } catch {
@@ -77,15 +88,24 @@ export function loadQueue(sessionId: string, home?: string): PromptQueueFile {
   }
 }
 
-function normalizeItem(it: Partial<PromptQueueItem>): PromptQueueItem {
+function normalizeItem(
+  it: Partial<PromptQueueItem>,
+  opts?: { recoverOrphanSending?: boolean },
+): PromptQueueItem {
+  let status: QueueItemStatus = "pending";
+  if (it.status === "failed") {
+    status = "failed";
+  } else if (it.status === "sending") {
+    // save 路径保留 sending；load 默认恢复为 pending（防永远卡死）
+    status = opts?.recoverOrphanSending ? "pending" : "sending";
+  }
   return {
     id: String(it.id || `q_${randomUUID()}`),
     display: String(it.display ?? it.content ?? ""),
     content: String(it.content ?? ""),
     attachments: Array.isArray(it.attachments) ? it.attachments : [],
     createdAt: it.createdAt || new Date().toISOString(),
-    status:
-      it.status === "sending" || it.status === "failed" ? it.status : "pending",
+    status,
     lastError: it.lastError ?? null,
   };
 }
@@ -100,10 +120,35 @@ export function saveQueue(q: PromptQueueFile, home?: string): PromptQueueFile {
     version: 1,
     sessionId: sid,
     updatedAt: new Date().toISOString(),
-    items: q.items.map(normalizeItem),
+    // 写入时保留 sending（recoverOrphanSending=false）
+    items: q.items.map((it) =>
+      normalizeItem(it, { recoverOrphanSending: false }),
+    ),
   };
-  fs.writeFileSync(queueFilePath(sid, home), JSON.stringify(next, null, 2), "utf8");
+  const dest = queueFilePath(sid, home);
+  const tmp = dest + ".tmp";
+  // 原子写：避免并发半写损坏后 load 静默清空队列
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2), "utf8");
+  fs.renameSync(tmp, dest);
   return next;
+}
+
+/** 删除会话时清理 L1 队列文件（幂等） */
+export function deleteQueueFile(sessionId: string, home?: string): void {
+  const sid = sessionId.trim();
+  if (!sid) return;
+  const p = queueFilePath(sid, home);
+  try {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } catch {
+    /* ignore */
+  }
+  try {
+    const tmp = p + ".tmp";
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+  } catch {
+    /* ignore */
+  }
 }
 
 export function enqueueItem(
@@ -141,7 +186,12 @@ export function removeItem(
 export function updateItem(
   sessionId: string,
   itemId: string,
-  patch: Partial<Pick<PromptQueueItem, "display" | "content" | "attachments" | "status" | "lastError">>,
+  patch: Partial<
+    Pick<
+      PromptQueueItem,
+      "display" | "content" | "attachments" | "status" | "lastError"
+    >
+  >,
   home?: string,
 ): PromptQueueFile {
   const q = loadQueue(sessionId, home);
@@ -188,28 +238,44 @@ export function clearQueue(sessionId: string, home?: string): PromptQueueFile {
 
 export function setQueueFlags(
   sessionId: string,
-  flags: { queueingEnabled?: boolean; pausedByInterrupt?: boolean; syncError?: string | null },
+  flags: {
+    queueingEnabled?: boolean;
+    pausedByInterrupt?: boolean;
+    syncError?: string | null;
+  },
   home?: string,
 ): PromptQueueFile {
   const q = loadQueue(sessionId, home);
-  if (flags.queueingEnabled !== undefined) q.queueingEnabled = flags.queueingEnabled;
-  if (flags.pausedByInterrupt !== undefined) q.pausedByInterrupt = flags.pausedByInterrupt;
+  if (flags.queueingEnabled !== undefined) {
+    q.queueingEnabled = flags.queueingEnabled;
+  }
+  if (flags.pausedByInterrupt !== undefined) {
+    q.pausedByInterrupt = flags.pausedByInterrupt;
+  }
   if (flags.syncError !== undefined) q.syncError = flags.syncError;
   return saveQueue(q, home);
 }
 
-/** Shift next pending item for drain (marks sending). */
+/** 取出下一条可发送项并标为 sending（L1 drain） */
 export function takeNextPending(
   sessionId: string,
   home?: string,
 ): { queue: PromptQueueFile; item: PromptQueueItem | null } {
-  const q = loadQueue(sessionId, home);
+  // 不恢复 orphan：进程内 Host 用 queueDrainLocked 互斥；
+  // 重启后由 loadQueue 默认 recover 把 sending→pending。
+  const q = loadQueue(sessionId, home, { recoverOrphanSending: false });
   if (q.pausedByInterrupt || !q.queueingEnabled) {
     return { queue: q, item: null };
   }
-  const idx = q.items.findIndex((i) => i.status === "pending" || i.status === "failed");
+  const idx = q.items.findIndex(
+    (i) => i.status === "pending" || i.status === "failed",
+  );
   if (idx < 0) return { queue: q, item: null };
-  const item = { ...q.items[idx]!, status: "sending" as const, lastError: null };
+  const item: PromptQueueItem = {
+    ...q.items[idx]!,
+    status: "sending",
+    lastError: null,
+  };
   q.items[idx] = item;
   return { queue: saveQueue(q, home), item };
 }
@@ -221,13 +287,18 @@ export function completeSending(
   error?: string,
   home?: string,
 ): PromptQueueFile {
-  const q = loadQueue(sessionId, home);
+  // 不恢复 sending→pending 再删，避免 id 仍在；直接读盘保留 status
+  const q = loadQueue(sessionId, home, { recoverOrphanSending: false });
   if (ok) {
     q.items = q.items.filter((i) => i.id !== itemId);
   } else {
     q.items = q.items.map((i) =>
       i.id === itemId
-        ? { ...i, status: "failed" as const, lastError: error ?? "send failed" }
+        ? {
+            ...i,
+            status: "failed" as const,
+            lastError: error ?? "send failed",
+          }
         : i,
     );
   }

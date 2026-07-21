@@ -484,40 +484,22 @@
                     不打断主对话的侧问。在下方输入问题后发送。
                   </div>
                 </div>
-                <!-- 与主对话 composer-card.compact 完全同构 -->
+                <!-- 轻量侧问输入：无附件/权限/计划/目标/模型（btw 单轮无工具） -->
                 <div class="btw-side-composer-wrap">
-                  <div class="composer-card compact btw-side-composer-card">
-                    <div id="btw-attachments" class="attach-chips hidden"></div>
+                  <p class="btw-side-hint" data-i18n="btw.sideHint">仅文字侧问 · 不调用工具 · 使用当前会话模型</p>
+                  <div class="composer-card compact btw-side-composer-card btw-side-composer-lite">
                     <textarea
                       id="btw-side-input"
                       rows="2"
                       data-i18n-placeholder="btw.sidePh"
-                      placeholder="要求后续变更"
+                      placeholder="顺便问一下…"
                       spellcheck="true"
                     ></textarea>
-                    <div class="composer-toolbar">
-                      <div class="composer-left">
-                        <button type="button" class="icon-ghost sm" id="btn-attach-btw" data-i18n-title="composer.attach" title="添加" aria-haspopup="menu">+</button>
-                        <button type="button" class="mode-chip" id="btn-perm-mode-btw">
-                          <span id="perm-label-btw" data-i18n="composer.permFull">完全访问</span>
-                          <span class="mode-chip-caret" aria-hidden="true">▾</span>
-                        </button>
-                        <span class="session-mode-chip hidden is-plan" id="chip-plan-btw" data-i18n-title="composer.planOn" title="计划模式已开启">
-                          <span class="session-mode-ico">≡</span>
-                          <span class="session-mode-label" data-i18n="composer.plan">计划</span>
-                          <button type="button" class="session-mode-x" data-chip-close="plan" data-i18n-title="composer.planClose" title="关闭计划模式" data-i18n-aria-label="composer.planClose" aria-label="关闭计划模式">×</button>
-                        </span>
-                        <span class="session-mode-chip hidden is-goal" id="chip-goal-btw" data-i18n-title="composer.goal" title="目标">
-                          <span class="session-mode-ico">◎</span>
-                          <span class="session-mode-label" data-i18n="composer.goal">目标</span>
-                          <button type="button" class="session-mode-x" data-chip-close="goal" data-i18n-title="composer.goalClear" title="清除目标" data-i18n-aria-label="composer.goalClear" aria-label="清除目标">×</button>
-                        </span>
+                    <div class="composer-toolbar btw-side-toolbar-lite">
+                      <div class="composer-left btw-side-meta" aria-hidden="false">
+                        <span class="btw-side-model-ro" id="btw-model-readonly" title="">—</span>
                       </div>
                       <div class="composer-right">
-                        <button type="button" class="model-chip" id="btn-model-btw" data-i18n-title="composer.model" title="模型与推理力度">
-                          <span class="model-chip-text" id="model-label-btw">grok</span>
-                          <span aria-hidden="true">▾</span>
-                        </button>
                         <button type="button" class="send-btn" id="btn-btw-send" data-i18n-title="btw.send" title="发送侧问" aria-label="发送">
                           <svg class="send-btn-ico" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none" aria-hidden="true" focusable="false"><path d="M9.33467 16.6663V4.93978L4.6374 9.63704L4.1667 9.16634L3.69599 8.69661L9.52998 2.86263L9.63447 2.77767C9.8925 2.60753 10.2433 2.63564 10.4704 2.86263L16.3034 8.69661L16.3884 8.80111C16.5588 9.05922 16.5306 9.40982 16.3034 9.63704C16.0762 9.86414 15.7255 9.89242 15.4675 9.722L15.363 9.63704L10.6647 4.9388V16.6663C10.6647 17.0336 10.367 17.3314 9.99971 17.3314C9.63259 17.3312 9.33467 17.0335 9.33467 16.6663ZM4.6374 9.63704C4.3777 9.89674 3.95569 9.89674 3.69599 9.63704C3.43657 9.37744 3.43668 8.95628 3.69599 8.69661L4.6374 9.63704Z" fill="currentColor"/></svg>
                         </button>
@@ -576,10 +558,12 @@
               <button type="button" class="side-cat-btn" data-cat="btw" id="btn-cat-btw" data-i18n-title="side.btw" title="旁路侧问" data-i18n-aria-label="side.btw" aria-label="旁路侧问">
                 <span class="side-cat-ico" data-sidebar-icon="chat" aria-hidden="true"></span>
               </button>
+              <button type="button" class="side-cat-btn" data-cat="plan" id="btn-cat-plan" data-i18n-title="side.plan" title="计划" data-i18n-aria-label="side.plan" aria-label="计划">
+                <span class="side-cat-ico" data-sidebar-icon="notebook" aria-hidden="true"></span>
+              </button>
               <button type="button" class="side-cat-btn" data-cat="agents" id="btn-cat-agents" data-i18n-title="side.agents" title="子代理" data-i18n-aria-label="side.agents" aria-label="子代理">
                 <span class="side-cat-ico" data-sidebar-icon="worktree" aria-hidden="true"></span>
               </button>
-              <!-- 计划栏不走分类轨：仅 /view-plan · 计划 chip · exit_plan 打开 -->
               <button type="button" class="side-cat-btn" data-cat="browser" id="btn-cat-browser" data-i18n-title="side.browser" title="浏览器" data-i18n-aria-label="side.browser" aria-label="浏览器">
                 <span class="side-cat-ico" data-sidebar-icon="globe" aria-hidden="true"></span>
               </button>
