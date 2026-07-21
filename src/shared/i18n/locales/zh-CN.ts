@@ -1142,6 +1142,7 @@ export const zhCN = {
   "session.resumeFail": "无法恢复会话",
   "session.createFail": "创建对话失败",
   "session.forkFail": "创建分支失败",
+  "session.bgStillRunning": "上一会话仍在后台运行",
   "auto.promptPh": "定时任务指令",
   "perm.needApprove": "需要批准：{summary}",
   "mode.cycleFullOn": "已开启完全访问",

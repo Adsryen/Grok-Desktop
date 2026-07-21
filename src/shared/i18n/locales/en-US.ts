@@ -1183,6 +1183,7 @@ export const enUS: MessageDict = {
   "session.resumeFail": "Cannot resume session",
   "session.createFail": "Failed to create chat",
   "session.forkFail": "Failed to fork session",
+  "session.bgStillRunning": "Previous session is still running in the background",
   "auto.promptPh": "Automation prompt",
   "perm.needApprove": "Approval needed: {summary}",
   "mode.cycleFullOn": "Full access enabled",

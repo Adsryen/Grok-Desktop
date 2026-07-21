@@ -3330,7 +3330,8 @@ async function startFreshSessionWithModel(
   // 先干净离开旧 live（保持项目 cwd 选中），再 create 空会话
   const keepProjectId = selectedProjectId;
   const keepCwd = cwd;
-  await leaveCurrentSessionToWelcome({ clearQueue: true });
+  // 保留旧会话 L1 队列；新会话空队列
+  await leaveCurrentSessionToWelcome({ clearQueue: false });
   if (keepProjectId) selectedProjectId = keepProjectId;
   setActiveCwd(keepCwd);
   clearPromptHistoryStore();
@@ -7325,18 +7326,28 @@ function isLiveThreadId(id: string | null | undefined): id is string {
  * 离开当前会话 → 欢迎页。
  * 产品约定：此处不 threads.create；用户在欢迎页输入并发送后才 startNewChat。
  * 必须：停 turn、detach live agent、清本地指针，避免旧会话事件/忙态粘在欢迎页。
+ *
+ * 队列：默认 **保留** 各 session 的 L1 落盘队列（再打开该会话可继续）；
+ * 仅 UI 镜像清空。删除会话时 Host 会删队列文件，无需此处 clear。
  */
 async function leaveCurrentSessionToWelcome(opts?: {
-  /** 默认 true：离开会话时清空本地 follow-up 队列 */
+  /** true：连 L1 队列一并清空；默认 false 只清 UI 镜像 */
   clearQueue?: boolean;
 }): Promise<void> {
-  const clearQueue = opts?.clearQueue !== false;
+  const clearQueue = opts?.clearQueue === true;
   const prevLiveId = isLiveThreadId(activeThreadId) ? activeThreadId : null;
+  const prevSid = activeSessionId;
 
   if (turnActive) {
+    // 停当前 turn；默认不 wipe 队列（interrupt pause 语义仍可用）
     await cancelTurn({ clearQueue });
   } else if (clearQueue) {
     clearPromptQueue({ silent: true });
+  } else {
+    // 仅卸下 UI 投影，磁盘 queues/{sessionId}.json 保留
+    promptQueue.length = 0;
+    queuePausedByInterrupt = false;
+    syncPromptQueueBar();
   }
 
   // cancel 失败或竞态时仍强制 UI 空闲
@@ -7351,6 +7362,8 @@ async function leaveCurrentSessionToWelcome(opts?: {
       console.warn("[leaveSession] detach failed", det.error?.message);
     }
   }
+  // detach 后 agent 已停，侧栏不应再转圈
+  if (prevSid) markSessionWorking(prevSid, false);
 
   closePlanPanelOnSessionChange();
   sessionViewGen += 1;
@@ -7387,10 +7400,10 @@ async function leaveCurrentSessionToWelcome(opts?: {
   void refreshProjectsAndThreads();
 }
 
-/** 若归档/删除的是当前会话，退回欢迎页 */
+/** 若归档/删除的是当前会话，退回欢迎页（保留其它会话队列；删除由 Host 清队列文件） */
 function leaveThreadIfOpen(t: ThreadRow): void {
   if (!isThreadOpen(t)) return;
-  void leaveCurrentSessionToWelcome({ clearQueue: true });
+  void leaveCurrentSessionToWelcome({ clearQueue: false });
 }
 
 async function archiveThread(t: ThreadRow, archived: boolean): Promise<void> {
@@ -7851,12 +7864,30 @@ async function openThread(t: ThreadRow): Promise<void> {
   // 加载 history 期间挂起直播事件，避免与磁盘回放叠双份
   suspendLiveTranscript = true;
   const viewGen = ++sessionViewGen;
-  endTurn(); // 切换会话时清理进行中 UI
-  hideAgentCrashBanner();
-  agentAvailableCommands = [];
+  const prevSid = activeSessionId;
   const sameSession =
     (!!activeSessionId && t.sessionId === activeSessionId) ||
     (!!activeThreadId && t.id === activeThreadId);
+  // 切会话：只清 UI turn，不 cancel 后台 agent（侧栏 working 继续转）
+  const wasActivelyTurning = turnActive;
+  const keepBgWorking =
+    !sameSession &&
+    !!prevSid &&
+    (wasActivelyTurning ||
+      workingSessions.has(prevSid) ||
+      threads.some(
+        (x) => x.sessionId === prevSid && x.status === "working",
+      ));
+  endTurn({ skipQueueDrain: true }); // 切换会话时清理进行中 UI
+  if (keepBgWorking && prevSid) {
+    markSessionWorking(prevSid, true);
+    // 仅从「正在跑 turn」切走时 toast，避免刷屏
+    if (wasActivelyTurning) {
+      showToast(tr("session.bgStillRunning"), "info");
+    }
+  }
+  hideAgentCrashBanner();
+  agentAvailableCommands = [];
   if (!sameSession) {
     closePlanPanelOnSessionChange();
     // S17：换会话重置 prompt 历史，稍后从磁盘 seed
@@ -10101,8 +10132,9 @@ npm start</pre>
     void continueRecentSession();
   };
   $("btn-new-chat").onclick = () => {
-    // 产品：只回欢迎页，发送第一条消息时再 threads.create
-    void leaveCurrentSessionToWelcome({ clearQueue: true }).then(() => {
+    // 产品：只回欢迎页，发送第一条消息时再 threads.create；
+    // 不清除上一会话 L1 队列（再点回该会话仍可继续排队消息）
+    void leaveCurrentSessionToWelcome({ clearQueue: false }).then(() => {
       ($("composer-input") as HTMLTextAreaElement).focus();
     });
   };

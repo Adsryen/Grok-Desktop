@@ -10,6 +10,10 @@ import { DesktopHost } from "../src/host/host.js";
 import { loadChatHistory } from "../src/host/history.js";
 import { loadQueue, queueFilePath } from "../src/host/prompt-queue.js";
 import { findSessionDir } from "../src/host/paths.js";
+import {
+  invalidateDiskRosterCache,
+  readSessionMeta,
+} from "../src/host/roster.js";
 
 const fakeAgent = path.join(__dirname, "fake-acp-agent.mjs");
 const homes: string[] = [];
@@ -276,6 +280,115 @@ describe("session lifecycle e2e", () => {
     },
     15_000,
   );
+
+  it("readSessionMeta prefers explicit title over first user query", () => {
+    const home = tempHome();
+    const cwd = tempCwd();
+    const sid = "sess_title_prio";
+    const enc = encodeURIComponent(path.resolve(cwd));
+    const dir = path.join(home, ".grok-desktop", "sessions", enc, sid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "summary.json"),
+      JSON.stringify({
+        title: "自定义标题",
+        generated_title: "自定义标题",
+        updated_at: new Date().toISOString(),
+        info: { cwd: path.resolve(cwd), id: sid },
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(dir, "chat_history.jsonl"),
+      JSON.stringify({
+        type: "user",
+        content: [
+          { type: "text", text: "<user_query>\n首条用户消息不该盖标题\n</user_query>" },
+        ],
+      }) + "\n",
+      "utf8",
+    );
+    const meta = readSessionMeta(dir, sid, cwd);
+    expect(meta.title).toContain("自定义");
+    expect(meta.title).not.toContain("首条用户");
+  });
+
+  it("readSessionMeta falls back to first user when no summary title", () => {
+    const home = tempHome();
+    const cwd = tempCwd();
+    const sid = "sess_title_user";
+    const enc = encodeURIComponent(path.resolve(cwd));
+    const dir = path.join(home, ".grok-desktop", "sessions", enc, sid);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "summary.json"),
+      JSON.stringify({
+        updated_at: new Date().toISOString(),
+        info: { cwd: path.resolve(cwd), id: sid },
+      }),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(dir, "chat_history.jsonl"),
+      JSON.stringify({
+        type: "user",
+        content: [
+          { type: "text", text: "<user_query>\n仅用用户首条\n</user_query>" },
+        ],
+      }) + "\n",
+      "utf8",
+    );
+    const meta = readSessionMeta(dir, sid, cwd);
+    expect(meta.title).toContain("仅用用户首条");
+  });
+
+  it("queue L1 survives session id still on disk after enqueue (leave-welcome semantics)", () => {
+    const home = tempHome();
+    const host = makeHost(home);
+    const sid = "sess_keep_q";
+    host.queueEnqueue(sid, { content: "keep-me", display: "k" });
+    // 模拟回欢迎：不调 queueClear，只读盘应仍在
+    expect(loadQueue(sid, home).items.map((i) => i.content)).toEqual([
+      "keep-me",
+    ]);
+    // 显式 clear 才消失
+    host.queueClear(sid);
+    expect(loadQueue(sid, home).items).toHaveLength(0);
+  });
+
+  it("fork invalidates disk roster cache so list sees child", async () => {
+    const home = tempHome();
+    const cwd = tempCwd();
+    const host = makeHost(home);
+    const created = await host.threadsCreate({ cwd, title: "src-inv" });
+    let srcDir = findSessionDir(created.sessionId, home);
+    if (!srcDir) {
+      const enc = encodeURIComponent(path.resolve(cwd));
+      srcDir = path.join(
+        home,
+        ".grok-desktop",
+        "sessions",
+        enc,
+        created.sessionId,
+      );
+      fs.mkdirSync(srcDir, { recursive: true });
+    }
+    fs.writeFileSync(
+      path.join(srcDir, "chat_history.jsonl"),
+      JSON.stringify({ role: "user", content: "x" }) + "\n",
+      "utf8",
+    );
+    // 预热 cache
+    host.listThreads();
+    const forked = await host.threadsFork({
+      sourceSessionId: created.sessionId,
+      cwd,
+      title: "child-inv",
+    });
+    invalidateDiskRosterCache(); // fork 内已 invalidate；再 list 必须含 child
+    const ids = host.listThreads().map((t) => t.sessionId);
+    expect(ids).toContain(forked.sessionId);
+  });
 
   it("export markdown works for disk session", async () => {
     const home = tempHome();

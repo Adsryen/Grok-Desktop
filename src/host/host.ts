@@ -1193,6 +1193,7 @@ export class DesktopHost {
       ref.live.thread.title = t;
       ref.live.thread.updatedAt = now;
     }
+    invalidateDiskRosterCache();
     this.logger.info("threads.rename", {
       threadId: ref.threadId,
       sessionId: ref.sessionId,
@@ -1537,6 +1538,7 @@ export class DesktopHost {
       }
     }
 
+    invalidateDiskRosterCache();
     this.logger.info("threads.fork", {
       sourceSessionId: sourceId,
       sessionId: created.sessionId,

@@ -5,7 +5,8 @@ import { cleanUserText, mapHistoryLine } from "./history.js";
 import { sessionsRoot } from "./paths.js";
 
 /** 磁盘会话扫描 TTL 缓存（listThreads 高频调用时避免反复 walk 全树） */
-const DISK_ROSTER_TTL_MS = 2500;
+/** 短 TTL：配合 create/fork/rename/delete 主动 invalidate，避免列表「半拍延迟」 */
+const DISK_ROSTER_TTL_MS = 1500;
 type DiskRosterRow = {
   sessionId: string;
   sessionDir: string;
@@ -149,6 +150,7 @@ export function readSessionMeta(
   isSubagent: boolean;
 } {
   let title = "";
+  let summaryFallback = "";
   let cwd = cwdHint ?? sessionDir;
   let updatedAt = new Date(0).toISOString();
   let createdAt = updatedAt;
@@ -175,8 +177,9 @@ export function readSessionMeta(
         agent_name?: string;
         info?: { cwd?: string; id?: string };
       };
-      title =
-        (s.generated_title || s.session_summary || s.title || "").trim();
+      // 显式标题（rename 写 generated_title + title）
+      title = (s.generated_title || s.title || "").trim();
+      summaryFallback = (s.session_summary || "").trim();
       if (s.info?.cwd) cwd = s.info.cwd;
       updatedAt =
         s.last_active_at ??
@@ -196,12 +199,16 @@ export function readSessionMeta(
     /* ignore */
   }
 
-  // Prefer first real user query (Codex 用首条用户消息作标题更直观)
-  // 子代理首条常是角色设定，不当作用户对话标题
-  if (!isSubagent) {
+  // 标题优先级：
+  // 1) summary.generated_title / title（含 rename）— 不被首条 user 覆盖
+  // 2) 首条真实 user（无显式标题时）
+  // 3) session_summary
+  // 4) sessionId 前缀
+  if (!title && !isSubagent) {
     const userTitle = firstUserQueryTitle(sessionDir);
     if (userTitle) title = userTitle;
   }
+  if (!title && summaryFallback) title = summaryFallback;
 
   title = sanitizeThreadTitle(title);
   if (!title) title = sessionId.slice(0, 8);
