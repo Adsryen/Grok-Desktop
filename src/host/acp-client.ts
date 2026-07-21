@@ -13,6 +13,12 @@ import {
   normalizeSessionNotification,
   normalizeSessionUpdate,
 } from "./normalize.js";
+import {
+  extractPermissionOptions,
+  resolvePermissionOptionId,
+  type PermissionDecisionWire,
+  type PermissionOptionLike,
+} from "./permission-options.js";
 
 type JsonRpcId = number | string;
 
@@ -30,6 +36,46 @@ export interface AcpClientOptions {
   threadId: string;
   onEvent: (event: NormalizedEvent) => void;
   allowFs?: boolean;
+}
+
+/** 从 tool.completed raw 抽出失败原因（权限 option 错误等） */
+function extractToolFailureMessage(
+  raw: unknown,
+  name?: string,
+): string | null {
+  const parts: string[] = [];
+  if (name?.trim()) parts.push(name.trim());
+  if (raw && typeof raw === "object") {
+    const r = raw as Record<string, unknown>;
+    const content = r.content;
+    if (Array.isArray(content)) {
+      for (const c of content) {
+        if (!c || typeof c !== "object") continue;
+        const inner = (c as { content?: { text?: string }; text?: string })
+          .content;
+        const t =
+          (typeof inner === "object" && inner && "text" in inner
+            ? String((inner as { text?: string }).text ?? "")
+            : "") ||
+          String((c as { text?: string }).text ?? "");
+        if (t.trim()) {
+          parts.push(t.trim().slice(0, 240));
+          break;
+        }
+      }
+    }
+    const out = r.rawOutput ?? r.raw_output;
+    if (out && typeof out === "object") {
+      const m = (out as { message?: string; error?: string }).message ??
+        (out as { error?: string }).error;
+      if (typeof m === "string" && m.trim()) parts.push(m.trim().slice(0, 240));
+    }
+    if (typeof r.message === "string" && r.message.trim()) {
+      parts.push(r.message.trim().slice(0, 240));
+    }
+  }
+  if (parts.length <= (name?.trim() ? 1 : 0)) return null;
+  return parts.join(": ").slice(0, 320);
 }
 
 /** 从 agent Internal error 包装里抽出可读原因（API 400 / 空 tool name 等） */
@@ -112,9 +158,17 @@ export class AcpClient {
   private streamedAssistantThisTurn = false;
   /** True if any tool/process activity was observed this turn. */
   private hadToolActivityThisTurn = false;
+  /** True if any tool ended failed this turn. */
+  private hadToolFailuresThisTurn = false;
+  /** Last tool failure text for UI. */
+  private lastToolFailureThisTurn: string | null = null;
   private permissionWaiters = new Map<
     string,
-    { resolve: (optionId: string) => void }
+    {
+      resolve: (optionId: string) => void;
+      /** agent 在 request_permission 里给出的合法 option 列表 */
+      options: PermissionOptionLike[];
+    }
   >();
   /** x.ai/exit_plan_mode 审批等待 */
   private planApprovalWaiters = new Map<
@@ -123,6 +177,17 @@ export class AcpClient {
       resolve: (resp: {
         outcome: "approved" | "cancelled" | "abandoned";
         feedback?: string;
+      }) => void;
+    }
+  >();
+  /** x.ai/ask_user_question 等待 UI 回答 */
+  private askUserWaiters = new Map<
+    string,
+    {
+      resolve: (resp: {
+        outcome: "accepted" | "cancelled" | "chat_about_this" | "skip_interview";
+        answers?: Record<string, string[]>;
+        partialAnswers?: Record<string, string>;
       }) => void;
     }
   >();
@@ -293,6 +358,8 @@ export class AcpClient {
 
     this.streamedAssistantThisTurn = false;
     this.hadToolActivityThisTurn = false;
+    this.hadToolFailuresThisTurn = false;
+    this.lastToolFailureThisTurn = null;
     this.opts.onEvent({
       type: "turn.started",
       threadId: this.opts.threadId,
@@ -335,6 +402,8 @@ export class AcpClient {
         hadAssistantText:
           this.streamedAssistantThisTurn || Boolean(result?.text),
         hadToolActivity: this.hadToolActivityThisTurn,
+        hadToolFailures: this.hadToolFailuresThisTurn,
+        lastToolFailure: this.lastToolFailureThisTurn ?? undefined,
       });
       this.opts.onEvent({
         type: "session.status",
@@ -359,6 +428,8 @@ export class AcpClient {
         error: message,
         hadAssistantText: this.streamedAssistantThisTurn,
         hadToolActivity: this.hadToolActivityThisTurn,
+        hadToolFailures: this.hadToolFailuresThisTurn,
+        lastToolFailure: this.lastToolFailureThisTurn ?? undefined,
       });
       this.opts.onEvent({
         type: "session.status",
@@ -873,7 +944,7 @@ export class AcpClient {
 
   respondPermission(
     requestId: string,
-    decision: "allow_once" | "allow_session" | "allow_always" | "deny",
+    decision: PermissionDecisionWire,
   ): void {
     const waiter = this.permissionWaiters.get(requestId);
     if (!waiter) {
@@ -883,15 +954,43 @@ export class AcpClient {
       );
     }
     this.permissionWaiters.delete(requestId);
-    const optionId =
-      decision === "deny"
-        ? "reject"
-        : decision === "allow_always"
-          ? "allow_always"
-          : decision === "allow_session"
-            ? "allow_session"
-            : "allow_once";
+    // 必须回 agent 给出的 optionId（allow-once 等），禁止写死 allow_once
+    const optionId = resolvePermissionOptionId(decision, waiter.options);
+    this.opts.logger?.info("acp.permission_option_resolved", {
+      requestId,
+      decision,
+      optionId,
+      optionCount: waiter.options.length,
+    });
     waiter.resolve(optionId);
+  }
+
+  hasAskUser(requestId?: string): boolean {
+    if (requestId) return this.askUserWaiters.has(requestId);
+    return this.askUserWaiters.size > 0;
+  }
+
+  /**
+   * UI 回答 ask_user_question。
+   * accepted: answers 为 question text → 所选 label[]。
+   */
+  respondAskUser(
+    requestId: string,
+    resp: {
+      outcome: "accepted" | "cancelled" | "chat_about_this" | "skip_interview";
+      answers?: Record<string, string[]>;
+      partialAnswers?: Record<string, string>;
+    },
+  ): void {
+    const waiter = this.askUserWaiters.get(requestId);
+    if (!waiter) {
+      throw new HostError(
+        "INVALID_ARGUMENT",
+        `Unknown ask_user requestId: ${requestId}`,
+      );
+    }
+    this.askUserWaiters.delete(requestId);
+    waiter.resolve(resp);
   }
 
   /**
@@ -1020,6 +1119,17 @@ export class AcpClient {
     for (const [id, w] of this.planApprovalWaiters) {
       w.resolve({ outcome: "abandoned" });
       this.planApprovalWaiters.delete(id);
+    }
+    // 未决权限：回 reject，避免 agent 永久挂起
+    for (const [id, w] of this.permissionWaiters) {
+      const rejectId = resolvePermissionOptionId("deny", w.options);
+      w.resolve(rejectId);
+      this.permissionWaiters.delete(id);
+    }
+    // 未决 ask_user：取消
+    for (const [id, w] of this.askUserWaiters) {
+      w.resolve({ outcome: "cancelled" });
+      this.askUserWaiters.delete(id);
     }
   }
 
@@ -1188,6 +1298,14 @@ export class AcpClient {
         if (ev.type === "message.delta" && ev.role === "assistant") {
           this.streamedAssistantThisTurn = true;
         }
+        if (ev.type === "tool.started" || ev.type === "tool.completed") {
+          this.hadToolActivityThisTurn = true;
+        }
+        if (ev.type === "tool.completed" && ev.status === "failed") {
+          this.hadToolFailuresThisTurn = true;
+          const failMsg = extractToolFailureMessage(ev.raw, ev.name);
+          if (failMsg) this.lastToolFailureThisTurn = failMsg;
+        }
         this.opts.onEvent(ev);
       }
       return;
@@ -1259,6 +1377,17 @@ export class AcpClient {
       method.endsWith("/exit_plan_mode")
     ) {
       void this.handleExitPlanMode(msg);
+      return;
+    }
+
+    // 用户选择题：shell → client reverse request
+    if (
+      method === "x.ai/ask_user_question" ||
+      method === "_x.ai/ask_user_question" ||
+      method === "ask_user_question" ||
+      method.endsWith("/ask_user_question")
+    ) {
+      void this.handleAskUserQuestion(msg);
       return;
     }
 
@@ -1355,10 +1484,12 @@ export class AcpClient {
       (toolCall?.kind as string) ??
       JSON.stringify(params).slice(0, 200);
 
+    const options = extractPermissionOptions(params);
+
     // 必须先登记 waiter，再发 permission.requested：
     // Host YOLO 在 onEvent 同步路径里 respondPermission，否则会 Unknown requestId 挂死 turn。
     const optionIdPromise = new Promise<string>((resolve) => {
-      this.permissionWaiters.set(requestId, { resolve });
+      this.permissionWaiters.set(requestId, { resolve, options });
     });
 
     this.opts.onEvent({
@@ -1367,6 +1498,11 @@ export class AcpClient {
       sessionId: sid,
       requestId,
       summary,
+      options: options.map((o) => ({
+        optionId: o.optionId ?? o.option_id ?? o.id ?? "",
+        name: o.name ?? o.label,
+        kind: o.kind,
+      })),
       raw: params,
     });
     this.opts.onEvent({
@@ -1382,6 +1518,138 @@ export class AcpClient {
       outcome: { outcome: "selected", optionId },
       selectedOption: optionId,
     });
+  }
+
+  /**
+   * `_x.ai/ask_user_question` / `x.ai/ask_user_question`
+   * 协议见 grok-build AskUserQuestionExtRequest/Response。
+   */
+  private async handleAskUserQuestion(
+    msg: Record<string, unknown>,
+  ): Promise<void> {
+    const id = msg.id as JsonRpcId;
+    const params = (msg.params ?? {}) as Record<string, unknown>;
+    // 部分 wire 把载荷包在 params 字符串 / params.params 里
+    let body: Record<string, unknown> = params;
+    if (typeof params.params === "string") {
+      try {
+        body = JSON.parse(params.params) as Record<string, unknown>;
+      } catch {
+        body = params;
+      }
+    } else if (params.params && typeof params.params === "object") {
+      body = params.params as Record<string, unknown>;
+    }
+
+    const requestId = `ask_${this.opts.threadId}_${String(id)}`;
+    const sid =
+      (body.sessionId as string) ??
+      (body.session_id as string) ??
+      this.sessionId ??
+      "unknown";
+    const toolCallId =
+      (body.toolCallId as string) ??
+      (body.tool_call_id as string) ??
+      undefined;
+    const modeRaw = String(body.mode ?? "default").toLowerCase();
+    const mode = modeRaw === "plan" ? "plan" : "default";
+    const questionsRaw = Array.isArray(body.questions) ? body.questions : [];
+    const questions = questionsRaw
+      .filter((q) => q && typeof q === "object")
+      .map((q) => {
+        const qq = q as Record<string, unknown>;
+        const opts = Array.isArray(qq.options) ? qq.options : [];
+        return {
+          question: String(qq.question ?? ""),
+          multiSelect: Boolean(qq.multiSelect ?? qq.multi_select),
+          options: opts
+            .filter((o) => o && typeof o === "object")
+            .map((o) => {
+              const oo = o as Record<string, unknown>;
+              return {
+                label: String(oo.label ?? ""),
+                description: String(oo.description ?? ""),
+                preview:
+                  typeof oo.preview === "string" ? oo.preview : undefined,
+              };
+            }),
+        };
+      })
+      .filter((q) => q.question);
+
+    if (!questions.length) {
+      // 无法展示：取消而非 error，避免工具红失败误导
+      this.respond(id, { outcome: "cancelled" });
+      return;
+    }
+
+    const decisionPromise = new Promise<{
+      outcome: "accepted" | "cancelled" | "chat_about_this" | "skip_interview";
+      answers?: Record<string, string[]>;
+      partialAnswers?: Record<string, string>;
+    }>((resolve) => {
+      this.askUserWaiters.set(requestId, { resolve });
+    });
+
+    this.opts.onEvent({
+      type: "ask_user.requested",
+      threadId: this.opts.threadId,
+      sessionId: sid,
+      requestId,
+      toolCallId,
+      mode,
+      questions,
+      raw: body,
+    });
+    this.opts.onEvent({
+      type: "session.status",
+      threadId: this.opts.threadId,
+      sessionId: sid,
+      status: "needs_input",
+    });
+
+    const decision = await decisionPromise;
+
+    // camelCase wire：AskUserQuestionExtResponse
+    let payload: Record<string, unknown>;
+    if (decision.outcome === "accepted") {
+      payload = {
+        outcome: "accepted",
+        answers: decision.answers ?? {},
+      };
+    } else if (decision.outcome === "chat_about_this") {
+      payload = {
+        outcome: "chat_about_this",
+        partialAnswers: decision.partialAnswers ?? {},
+      };
+    } else if (decision.outcome === "skip_interview") {
+      payload = {
+        outcome: "skip_interview",
+        partialAnswers: decision.partialAnswers ?? {},
+      };
+    } else {
+      payload = { outcome: "cancelled" };
+    }
+
+    try {
+      this.respond(id, payload);
+      this.opts.logger?.info("acp.ask_user_responded", {
+        requestId,
+        outcome: decision.outcome,
+      });
+      this.opts.onEvent({
+        type: "session.status",
+        threadId: this.opts.threadId,
+        sessionId: sid,
+        status: "working",
+      });
+    } catch (err) {
+      this.opts.logger?.warn("acp.ask_user_respond_failed", {
+        requestId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   }
 
   private async handleReadTextFile(msg: Record<string, unknown>): Promise<void> {

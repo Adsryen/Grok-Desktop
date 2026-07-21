@@ -620,6 +620,17 @@ async function handleHostIpc(
     case "permissions.respond":
       host.permissionsRespond(p.requestId as string, p.decision as never);
       return resultOk({ responded: true });
+    case "askUser.respond":
+      host.askUserRespond(p.requestId as string, {
+        outcome: p.outcome as
+          | "accepted"
+          | "cancelled"
+          | "chat_about_this"
+          | "skip_interview",
+        answers: p.answers as Record<string, string[]> | undefined,
+        partialAnswers: p.partialAnswers as Record<string, string> | undefined,
+      });
+      return resultOk({ responded: true });
     case "history.load":
       return resultOk(
         host.historyLoad(p.sessionId as string, {

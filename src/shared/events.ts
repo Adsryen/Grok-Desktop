@@ -22,6 +22,10 @@ export type NormalizedEvent =
       hadAssistantText?: boolean;
       /** True if any tool/process activity was observed this turn */
       hadToolActivity?: boolean;
+      /** True if any tool ended with status failed this turn */
+      hadToolFailures?: boolean;
+      /** Last tool failure message (for UI hint) */
+      lastToolFailure?: string;
     }
   | {
       type: "message.delta";
@@ -50,6 +54,8 @@ export type NormalizedEvent =
       sessionId: string;
       toolCallId?: string;
       name?: string;
+      /** completed | failed（来自 agent tool_call_update.status） */
+      status?: "completed" | "failed";
       raw?: unknown;
     }
   | {
@@ -58,6 +64,26 @@ export type NormalizedEvent =
       sessionId: string;
       requestId: string;
       summary: string;
+      /** agent 给出的合法 option 列表（Host 映射 decision → optionId） */
+      options?: Array<{ optionId: string; name?: string; kind?: string }>;
+      raw?: unknown;
+    }
+  | {
+      type: "ask_user.requested";
+      threadId: string;
+      sessionId: string;
+      requestId: string;
+      toolCallId?: string;
+      mode: "default" | "plan";
+      questions: Array<{
+        question: string;
+        multiSelect?: boolean;
+        options: Array<{
+          label: string;
+          description?: string;
+          preview?: string;
+        }>;
+      }>;
       raw?: unknown;
     }
   | {

@@ -7323,9 +7323,29 @@ function isLiveThreadId(id: string | null | undefined): id is string {
 }
 
 /**
+ * 最小集：点「新对话」时是否需要确认。
+ * 有进行中 turn / 侧栏 working / live 附着 → 弹窗；否则一键回欢迎页。
+ */
+function shouldConfirmLeaveForNewChat(): boolean {
+  if (!activeSessionId && !isLiveThreadId(activeThreadId)) return false;
+  if (turnActive) return true;
+  if (activeSessionId && workingSessions.has(activeSessionId)) return true;
+  if (
+    activeSessionId &&
+    threads.some((x) => x.sessionId === activeSessionId && x.status === "working")
+  ) {
+    return true;
+  }
+  if (attachUiState === "live" || attachUiState === "attaching") return true;
+  return false;
+}
+
+/**
  * 离开当前会话 → 欢迎页。
  * 产品约定：此处不 threads.create；用户在欢迎页输入并发送后才 startNewChat。
- * 必须：停 turn、detach live agent、清本地指针，避免旧会话事件/忙态粘在欢迎页。
+ *
+ * keepBackground=false（默认）：停 turn、detach live agent（硬离开）。
+ * keepBackground=true：对齐切会话——只清 UI，后台 agent 继续。
  *
  * 队列：默认 **保留** 各 session 的 L1 落盘队列（再打开该会话可继续）；
  * 仅 UI 镜像清空。删除会话时 Host 会删队列文件，无需此处 clear。
@@ -7333,37 +7353,66 @@ function isLiveThreadId(id: string | null | undefined): id is string {
 async function leaveCurrentSessionToWelcome(opts?: {
   /** true：连 L1 队列一并清空；默认 false 只清 UI 镜像 */
   clearQueue?: boolean;
+  /**
+   * true：不 cancel / 不 detach，侧栏可继续 working（对齐 openThread 切会话）。
+   * false（默认）：cancel + detach，彻底断开。
+   */
+  keepBackground?: boolean;
 }): Promise<void> {
   const clearQueue = opts?.clearQueue === true;
+  const keepBackground = opts?.keepBackground === true;
   const prevLiveId = isLiveThreadId(activeThreadId) ? activeThreadId : null;
   const prevSid = activeSessionId;
+  const wasTurning = turnActive;
+  const keepBgWorking =
+    keepBackground &&
+    !!prevSid &&
+    (wasTurning ||
+      workingSessions.has(prevSid) ||
+      threads.some(
+        (x) => x.sessionId === prevSid && x.status === "working",
+      ));
 
-  if (turnActive) {
-    // 停当前 turn；默认不 wipe 队列（interrupt pause 语义仍可用）
-    await cancelTurn({ clearQueue });
-  } else if (clearQueue) {
-    clearPromptQueue({ silent: true });
-  } else {
-    // 仅卸下 UI 投影，磁盘 queues/{sessionId}.json 保留
-    promptQueue.length = 0;
-    queuePausedByInterrupt = false;
-    syncPromptQueueBar();
-  }
-
-  // cancel 失败或竞态时仍强制 UI 空闲
-  if (turnActive) {
-    endTurn({ skipQueueDrain: true, outcome: "stopped" });
-  }
-
-  if (prevLiveId) {
-    const det = await inv("threads.detach", { threadId: prevLiveId });
-    if (!det.ok) {
-      // 会话可能已死；不挡回欢迎页
-      console.warn("[leaveSession] detach failed", det.error?.message);
+  if (keepBackground) {
+    // 软离开：只卸 UI 投影；磁盘队列保留；不 cancel / 不 detach
+    if (clearQueue) {
+      clearPromptQueue({ silent: true });
+    } else {
+      promptQueue.length = 0;
+      queuePausedByInterrupt = false;
+      syncPromptQueueBar();
     }
+    if (turnActive) {
+      endTurn({ skipQueueDrain: true });
+    }
+  } else {
+    if (turnActive) {
+      // 停当前 turn；默认不 wipe 队列（interrupt pause 语义仍可用）
+      await cancelTurn({ clearQueue });
+    } else if (clearQueue) {
+      clearPromptQueue({ silent: true });
+    } else {
+      // 仅卸下 UI 投影，磁盘 queues/{sessionId}.json 保留
+      promptQueue.length = 0;
+      queuePausedByInterrupt = false;
+      syncPromptQueueBar();
+    }
+
+    // cancel 失败或竞态时仍强制 UI 空闲
+    if (turnActive) {
+      endTurn({ skipQueueDrain: true, outcome: "stopped" });
+    }
+
+    if (prevLiveId) {
+      const det = await inv("threads.detach", { threadId: prevLiveId });
+      if (!det.ok) {
+        // 会话可能已死；不挡回欢迎页
+        console.warn("[leaveSession] detach failed", det.error?.message);
+      }
+    }
+    // detach 后 agent 已停，侧栏不应再转圈
+    if (prevSid) markSessionWorking(prevSid, false);
   }
-  // detach 后 agent 已停，侧栏不应再转圈
-  if (prevSid) markSessionWorking(prevSid, false);
 
   closePlanPanelOnSessionChange();
   sessionViewGen += 1;
@@ -7394,10 +7443,83 @@ async function leaveCurrentSessionToWelcome(opts?: {
   setComposerBusy(false);
   attachUiState = "history_only";
   syncAttachPill();
+  // 软离开：恢复侧栏 working（endTurn 会清掉 active 的 working 标记）
+  if (keepBgWorking && prevSid) {
+    markSessionWorking(prevSid, true);
+    if (wasTurning) {
+      showToast(tr("session.bgStillRunning"), "info");
+    }
+  }
   showWelcome(true);
   setWelcomeTitle();
   renderGoalBanner();
   void refreshProjectsAndThreads();
+}
+
+/**
+ * 「新对话」：最小集确认后离开当前会话 → 欢迎页。
+ * 默认「不保持」（cancel+detach）；可选「保持」后台继续。
+ */
+async function handleNewChatClick(): Promise<void> {
+  let keepBackground = false;
+  if (shouldConfirmLeaveForNewChat()) {
+    const choice = await confirmNewChatLeave();
+    if (choice === "cancel") return;
+    keepBackground = choice === "keep";
+  }
+  await leaveCurrentSessionToWelcome({
+    clearQueue: false,
+    keepBackground,
+  });
+  ($("composer-input") as HTMLTextAreaElement).focus();
+}
+
+/** 新对话确认：不保持（默认主按钮）/ 保持 / 取消（含 X / 遮罩 / Esc） */
+function confirmNewChatLeave(): Promise<"discard" | "keep" | "cancel"> {
+  return new Promise((resolve) => {
+    openModal(
+      tr("nav.newChatConfirmTitle"),
+      `<p class="prompt-dlg-hint" style="white-space:pre-wrap">${esc(tr("nav.newChatConfirmBody"))}</p>
+       <div class="prompt-dlg-actions">
+         <button type="button" class="btn-ghost" id="new-chat-cancel">${esc(tr("common.cancel"))}</button>
+         <button type="button" class="btn-ghost" id="new-chat-keep">${esc(tr("nav.newChatKeep"))}</button>
+         <button type="button" class="btn-dark" id="new-chat-discard">${esc(tr("nav.newChatDiscard"))}</button>
+       </div>`,
+    );
+    let settled = false;
+    const finish = (v: "discard" | "keep" | "cancel") => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      // 恢复全局关闭为「只关层」；本确认已 resolve
+      $("btn-modal-close").onclick = () => closeModal();
+      $("modal").onclick = (e) => {
+        if (e.target === $("modal")) closeModal();
+      };
+      closeModal();
+      resolve(v);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish("cancel");
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    // 确认期间 X / 点遮罩 = 取消（避免 Promise 悬挂）
+    $("btn-modal-close").onclick = () => finish("cancel");
+    $("modal").onclick = (e) => {
+      if (e.target === $("modal")) finish("cancel");
+    };
+    $("new-chat-cancel").onclick = () => finish("cancel");
+    $("new-chat-keep").onclick = () => finish("keep");
+    $("new-chat-discard").onclick = () => finish("discard");
+    // 主按钮默认焦点：不保持
+    requestAnimationFrame(() => {
+      ($("new-chat-discard") as HTMLButtonElement).focus();
+    });
+  });
 }
 
 /** 若归档/删除的是当前会话，退回欢迎页（保留其它会话队列；删除由 Host 清队列文件） */
@@ -9513,10 +9635,10 @@ function showPermission(requestId: string, summary: string): void {
   }
   const bar = $("permission-bar");
   bar.classList.remove("hidden");
-  bar.innerHTML = `<div>需要批准：${esc(summary)}</div>`;
+  bar.innerHTML = `<div>${esc(tr("perm.needApprove", { summary }) || `需要批准：${summary}`)}</div>`;
   for (const [label, decision] of [
-    ["允许", "allow_once"],
-    ["拒绝", "deny"],
+    [tr("perm.allow") || "允许", "allow_once"],
+    [tr("perm.deny") || "拒绝", "deny"],
   ] as const) {
     const b = document.createElement("button");
     b.className = decision === "allow_once" ? "btn-dark" : "btn-ghost";
@@ -9532,6 +9654,138 @@ function showPermission(requestId: string, summary: string): void {
     bar.appendChild(b);
   }
   showWelcome(false);
+}
+
+/** 从 tool raw 抽失败摘要（过程块 / 系统行） */
+function extractToolFailHint(raw: unknown, name?: string): string | null {
+  if (!raw || typeof raw !== "object") {
+    return name ? `${name}: failed` : null;
+  }
+  const r = raw as Record<string, unknown>;
+  const content = r.content;
+  if (Array.isArray(content)) {
+    for (const c of content) {
+      if (!c || typeof c !== "object") continue;
+      const inner = (c as { content?: { text?: string }; text?: string }).content;
+      const t =
+        (typeof inner === "object" && inner && "text" in inner
+          ? String((inner as { text?: string }).text ?? "")
+          : "") || String((c as { text?: string }).text ?? "");
+      if (t.trim()) {
+        const short = t.trim().slice(0, 200);
+        return name ? `${name}: ${short}` : short;
+      }
+    }
+  }
+  const out = r.rawOutput ?? r.raw_output;
+  if (out && typeof out === "object") {
+    const m =
+      (out as { message?: string }).message ??
+      (out as { error?: string }).error;
+    if (typeof m === "string" && m.trim()) {
+      const short = m.trim().slice(0, 200);
+      return name ? `${name}: ${short}` : short;
+    }
+  }
+  return name ? `${name}: failed` : null;
+}
+
+/**
+ * ask_user_question UI：单选/多选题目；提交 → askUser.respond accepted。
+ * plan 模式额外提供「取消」。
+ */
+async function showAskUserDialog(ev: {
+  requestId: string;
+  mode?: string;
+  questions?: Array<{
+    question: string;
+    multiSelect?: boolean;
+    options: Array<{ label: string; description?: string }>;
+  }>;
+}): Promise<void> {
+  const questions = ev.questions ?? [];
+  if (!questions.length) {
+    void inv("askUser.respond", {
+      requestId: ev.requestId,
+      outcome: "cancelled",
+    });
+    return;
+  }
+
+  const parts: string[] = [
+    `<p class="prompt-dlg-hint">${esc(tr("askUser.hint") || "请选择后继续")}</p>`,
+  ];
+  questions.forEach((q, qi) => {
+    const multi = Boolean(q.multiSelect);
+    parts.push(
+      `<div class="ask-user-q" data-qi="${qi}" data-multi="${multi ? "1" : "0"}">
+        <div class="ask-user-q-title">${esc(q.question)}</div>
+        <div class="ask-user-opts">`,
+    );
+    (q.options ?? []).forEach((opt, oi) => {
+      const inputType = multi ? "checkbox" : "radio";
+      const name = `ask_q_${qi}`;
+      const id = `ask_q_${qi}_${oi}`;
+      parts.push(
+        `<label class="ask-user-opt" for="${id}">
+          <input type="${inputType}" name="${name}" id="${id}" value="${esc(opt.label)}" />
+          <span class="ask-user-opt-label">${esc(opt.label)}</span>
+          ${opt.description ? `<span class="ask-user-opt-desc">${esc(opt.description)}</span>` : ""}
+        </label>`,
+      );
+    });
+    parts.push(`</div></div>`);
+  });
+  parts.push(`
+    <div class="prompt-dlg-actions">
+      <button type="button" class="btn-ghost" id="ask-user-cancel">${esc(tr("common.cancel"))}</button>
+      <button type="button" class="btn-dark" id="ask-user-ok">${esc(tr("askUser.submit") || "提交")}</button>
+    </div>`);
+
+  openModal(tr("askUser.title") || "需要你的选择", parts.join(""));
+
+  const finish = async (
+    outcome: "accepted" | "cancelled",
+    answers?: Record<string, string[]>,
+  ) => {
+    closeModal();
+    try {
+      await inv("askUser.respond", {
+        requestId: ev.requestId,
+        outcome,
+        answers,
+      });
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : tr("askUser.fail") || "提交失败",
+        "error",
+      );
+    }
+  };
+
+  $("ask-user-cancel").onclick = () => void finish("cancelled");
+  $("ask-user-ok").onclick = () => {
+    const answers: Record<string, string[]> = {};
+    let missing = false;
+    questions.forEach((q, qi) => {
+      const wrap = document.querySelector(
+        `.ask-user-q[data-qi="${qi}"]`,
+      ) as HTMLElement | null;
+      if (!wrap) return;
+      const multi = wrap.dataset.multi === "1";
+      const inputs = Array.from(
+        wrap.querySelectorAll("input:checked"),
+      ) as HTMLInputElement[];
+      const labels = inputs.map((i) => i.value).filter(Boolean);
+      if (!labels.length) missing = true;
+      else answers[q.question] = multi ? labels : [labels[0]!];
+    });
+    if (missing) {
+      showToast(tr("askUser.needPick") || "请完成所有选择", "error");
+      return;
+    }
+    void finish("accepted", answers);
+  };
 }
 
 async function handleDeepLinkPayload(payload: string): Promise<void> {
@@ -9686,6 +9940,7 @@ function isTranscriptScopedEvent(ev: { type?: string }): boolean {
     case "turn.started":
     case "turn.completed":
     case "permission.requested":
+    case "ask_user.requested":
     case "context.compacted":
     case "agent.error":
       return true;
@@ -9874,7 +10129,17 @@ function onEvent(raw: unknown): void {
       markToolStarted(ev.name || "tool", ev.toolCallId, ev.raw);
       break;
     case "tool.completed": {
-      markToolCompleted(ev.toolCallId, ev.name, ev.raw);
+      const failed = (ev as { status?: string }).status === "failed";
+      if (failed) {
+        markToolIncomplete(ev.toolCallId, ev.name, true);
+        // 过程块可见失败摘要（权限 option 错误等）
+        const failHint = extractToolFailHint(ev.raw, ev.name);
+        if (failHint) {
+          appendProcessText(failHint);
+        }
+      } else {
+        markToolCompleted(ev.toolCallId, ev.name, ev.raw);
+      }
       // 双保险：从 tool raw 再抽一次 update_goal（normalize 已推 goal.updated 时为幂等）
       maybeGoalFromToolRaw(ev.name, ev.raw);
       // 写文件 / shell 后刷新侧栏文件树（fs.watch 也会兜底）
@@ -9897,12 +10162,32 @@ function onEvent(raw: unknown): void {
         : "";
       const hadText = Boolean((ev as { hadAssistantText?: boolean }).hadAssistantText);
       const hadTools = Boolean((ev as { hadToolActivity?: boolean }).hadToolActivity);
+      const hadToolFailures = Boolean(
+        (ev as { hadToolFailures?: boolean }).hadToolFailures,
+      );
+      const lastToolFailure = String(
+        (ev as { lastToolFailure?: string }).lastToolFailure || "",
+      ).trim();
       endTurn();
       // 超时/错误：只走友好标题；与 turns.prompt 失败共用 showTurnErrorOnce 去重
       if (stop === "timeout" || /timed out/i.test(errMsg)) {
         showTurnErrorOnce(errMsg || "timeout");
       } else if (errMsg && stop === "error") {
         showTurnErrorOnce(errMsg);
+      } else if (hadToolFailures) {
+        // P1/P2：工具失败（如权限 option 被拒）时明确提示，避免「已完成但空白」
+        const detail = lastToolFailure
+          ? lastToolFailure.slice(0, 280)
+          : "";
+        appendLine(
+          detail
+            ? tr("chat.turnToolFailedDetail", { detail })
+            : tr("chat.turnToolFailed"),
+          "system",
+        );
+        if (!hadText) {
+          appendLine(tr("chat.turnToolsOnly"), "system");
+        }
       } else if (!hadText && !hadTools) {
         appendLine(
           tr("chat.turnEmpty") ||
@@ -9920,6 +10205,13 @@ function onEvent(raw: unknown): void {
       void refreshContextUsage();
       sidePane?.scheduleRefreshFileTree(400);
       void afterTurnSettled();
+      break;
+    }
+    case "ask_user.requested": {
+      showWelcome(false);
+      if (!turnActive) beginTurn();
+      setTurnStatus(tr("askUser.waiting") || "等待你的选择…");
+      void showAskUserDialog(ev);
       break;
     }
     case "context.compacted":
@@ -10132,11 +10424,8 @@ npm start</pre>
     void continueRecentSession();
   };
   $("btn-new-chat").onclick = () => {
-    // 产品：只回欢迎页，发送第一条消息时再 threads.create；
-    // 不清除上一会话 L1 队列（再点回该会话仍可继续排队消息）
-    void leaveCurrentSessionToWelcome({ clearQueue: false }).then(() => {
-      ($("composer-input") as HTMLTextAreaElement).focus();
-    });
+    // 最小集确认 + 默认不保持；发送第一条消息时再 threads.create
+    void handleNewChatClick();
   };
 
   $("btn-context").onclick = () => {

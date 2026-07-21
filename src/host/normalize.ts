@@ -86,6 +86,7 @@ export function normalizeSessionUpdate(
             (update.tool as string) ??
             (update.name as string) ??
             (update.title as string),
+          status: status === "failed" ? "failed" : "completed",
           raw: update,
         });
         const goalEv = deriveGoalFromUpdateGoalTool(

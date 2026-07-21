@@ -136,9 +136,10 @@ rl.on("line", async (line) => {
           sessionId,
           description: "Allow fake tool?",
           toolCall: { toolCallId: "tc1", title: "echo" },
+          // 对齐 Grok Build 连字符 optionId（Desktop 须原样回传）
           options: [
-            { optionId: "allow_once", name: "Allow once" },
-            { optionId: "reject", name: "Reject" },
+            { optionId: "allow-once", name: "Allow once", kind: "allow_once" },
+            { optionId: "reject-once", name: "Reject", kind: "reject_once" },
           ],
         });
       } catch {

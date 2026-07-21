@@ -1890,6 +1890,42 @@ export class DesktopHost {
     );
   }
 
+  /**
+   * 回答 ask_user_question（UI 选择题）。
+   */
+  askUserRespond(
+    requestId: string,
+    resp: {
+      outcome: "accepted" | "cancelled" | "chat_about_this" | "skip_interview";
+      answers?: Record<string, string[]>;
+      partialAnswers?: Record<string, string>;
+    },
+  ): void {
+    const rid = requestId?.trim();
+    if (!rid) {
+      throw new HostError("INVALID_ARGUMENT", "requestId required");
+    }
+    for (const live of this.threads.values()) {
+      if (!live.client?.hasAskUser(rid)) continue;
+      live.client.respondAskUser(rid, resp);
+      return;
+    }
+    for (const live of this.threads.values()) {
+      if (!live.client) continue;
+      try {
+        live.client.respondAskUser(rid, resp);
+        return;
+      } catch (err) {
+        if (isHostError(err) && err.code === "INVALID_ARGUMENT") continue;
+        throw err;
+      }
+    }
+    throw new HostError(
+      "INVALID_ARGUMENT",
+      `No pending ask_user request: ${rid}`,
+    );
+  }
+
   historyLoad(
     sessionId: string,
     opts?: import("../shared/types.js").HistoryLoadOptions,

@@ -87,6 +87,7 @@ export type HostIpcMethod =
   | "turns.prompt"
   | "turns.cancel"
   | "permissions.respond"
+  | "askUser.respond"
   | "history.load"
   // roster / inbox
   | "roster.list"

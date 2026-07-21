@@ -3404,6 +3404,40 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
 }
 .permission-bar .btn-dark, .permission-bar .btn-ghost { margin: 6px 6px 0 0; }
 
+/* ask_user_question 选择题 */
+.ask-user-q {
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.ask-user-q:last-of-type { border-bottom: 0; }
+.ask-user-q-title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+  color: var(--text);
+}
+.ask-user-opts { display: flex; flex-direction: column; gap: 6px; }
+.ask-user-opt {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 8px;
+  align-items: start;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  cursor: pointer;
+  font-size: 13px;
+}
+.ask-user-opt:hover { background: var(--bg-elevated); }
+.ask-user-opt input { margin-top: 2px; }
+.ask-user-opt-label { font-weight: 500; }
+.ask-user-opt-desc {
+  grid-column: 2;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
 /* S19：本地 follow-up 排队条（输入框上方） */
 .prompt-queue-bar {
   width: 100%;
