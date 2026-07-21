@@ -621,7 +621,13 @@ async function handleHostIpc(
       host.permissionsRespond(p.requestId as string, p.decision as never);
       return resultOk({ responded: true });
     case "history.load":
-      return resultOk(host.historyLoad(p.sessionId as string));
+      return resultOk(
+        host.historyLoad(p.sessionId as string, {
+          maxEntries:
+            typeof p.maxEntries === "number" ? p.maxEntries : undefined,
+          maxBytes: typeof p.maxBytes === "number" ? p.maxBytes : undefined,
+        }),
+      );
     case "session.context":
       return resultOk(host.sessionContext(p.sessionId as string));
     case "roster.list":

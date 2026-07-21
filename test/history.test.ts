@@ -7,6 +7,7 @@ import {
   extractText,
   loadChatHistory,
   mapHistoryLine,
+  readHistoryText,
 } from "../src/host/history.js";
 
 describe("chat history parsing (UI transcript)", () => {
@@ -127,5 +128,48 @@ describe("chat history parsing (UI transcript)", () => {
     expect(page.entries.every((e) => !e.text.includes("[object Object]"))).toBe(
       true,
     );
+  });
+
+  it("loadChatHistory respects maxEntries and marks truncated", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-hist-cap-"));
+    const cwdEnc = encodeURIComponent("D:\\tmp\\cap");
+    const sessionId = "sess_hist_cap";
+    const dir = path.join(home, ".grok-desktop", "sessions", cwdEnc, sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    const lines: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      lines.push(
+        JSON.stringify({
+          type: "user",
+          content: [{ type: "text", text: `<user_query>\nmsg-${i}\n</user_query>` }],
+        }),
+      );
+      lines.push(
+        JSON.stringify({
+          type: "assistant",
+          content: `reply-${i}`,
+        }),
+      );
+    }
+    fs.writeFileSync(path.join(dir, "chat_history.jsonl"), lines.join("\n"), "utf8");
+    const page = loadChatHistory(sessionId, home, { maxEntries: 10 });
+    expect(page.entries.length).toBe(10);
+    expect(page.truncated).toBe(true);
+    // 保留较新部分
+    expect(page.entries[page.entries.length - 1]?.text).toContain("reply-19");
+  });
+
+  it("readHistoryText truncates large files from the end", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-hist-bytes-"));
+    const file = path.join(home, "big.jsonl");
+    const pad = "x".repeat(2000);
+    const lines = [
+      JSON.stringify({ type: "user", content: `old-${pad}` }),
+      JSON.stringify({ type: "user", content: "tail-line-only" }),
+    ];
+    fs.writeFileSync(file, lines.join("\n"), "utf8");
+    const r = readHistoryText(file, 800);
+    expect(r.truncatedBytes).toBe(true);
+    expect(r.text).toContain("tail-line-only");
   });
 });

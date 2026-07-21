@@ -2639,6 +2639,14 @@ html[data-theme="dark"] .send-btn:hover { filter: brightness(0.92); }
   line-height: 1.2;
   user-select: none;
 }
+.user-msg-block.is-send-failed .line.user {
+  border: 1px solid color-mix(in srgb, var(--danger, #c44) 45%, transparent);
+  opacity: 0.88;
+}
+.msg-send-failed {
+  color: var(--danger, #c44);
+  font-size: 11px;
+}
 .msg-user-time {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.01em;

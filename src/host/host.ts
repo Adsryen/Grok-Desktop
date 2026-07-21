@@ -114,6 +114,7 @@ import { ProjectRegistry } from "./projects.js";
 import { buildGrokInfo, type ResolveGrokOptions } from "./resolve-grok.js";
 import {
   buildRoster,
+  invalidateDiskRosterCache,
   isGoalInfraSession,
   readSessionMeta,
   sanitizeThreadTitle,
@@ -572,7 +573,8 @@ export class DesktopHost {
         // 展示/回填用「仍可用」的模型；幽灵 id 回退默认（不改写历史消息）
         model: this.resolveAvailableModel(rawModel),
         effort: liveHit?.effort ?? smeta.effort,
-        pinned: r.pinned,
+        // pin 以 thread-meta 为准（disk 会话也可置顶）
+        pinned: smeta.pinned === true || r.pinned === true || liveHit?.pinned === true,
         archived,
         sessionKind,
         parentSessionId,
@@ -581,7 +583,12 @@ export class DesktopHost {
       });
     }
 
-    return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    return out.sort((a, b) => {
+      if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+        return a.pinned ? -1 : 1;
+      }
+      return b.updatedAt.localeCompare(a.updatedAt);
+    });
   }
 
   /** 解析 threadId（live 或 disk_<sessionId>）→ sessionId + 可选 live */
@@ -833,6 +840,7 @@ export class DesktopHost {
       }
 
       await this.enforceLiveAttachBudget();
+      invalidateDiskRosterCache();
       this.logger.info("threads.create", { threadId, sessionId, cwd });
       return { threadId, sessionId, cwd, worktreeId };
     } catch (err) {
@@ -1230,11 +1238,25 @@ export class DesktopHost {
   }
 
   threadsPin(threadId: string, pinned: boolean): Thread {
-    const live = this.threads.get(threadId);
-    if (!live) throw new HostError("SESSION_NOT_FOUND", `Unknown Thread: ${threadId}`);
-    live.thread.pinned = pinned;
-    live.thread.updatedAt = new Date().toISOString();
-    return { ...live.thread };
+    const ref = this.resolveThreadRef(threadId);
+    if (!ref.sessionId) {
+      throw new HostError(
+        "SESSION_NOT_FOUND",
+        `Thread has no sessionId: ${threadId}`,
+      );
+    }
+    this.threadMeta.setPinned(ref.sessionId, pinned);
+    const now = new Date().toISOString();
+    if (ref.live) {
+      ref.live.thread.pinned = pinned;
+      ref.live.thread.updatedAt = now;
+    }
+    this.logger.info("threads.pin", {
+      threadId: ref.threadId,
+      sessionId: ref.sessionId,
+      pinned,
+    });
+    return this.snapshotThread(ref, { pinned, updatedAt: now });
   }
 
   threadsArchive(threadId: string, archived: boolean): Thread {
@@ -1302,6 +1324,7 @@ export class DesktopHost {
     }
 
     this.threadMeta.remove(ref.sessionId);
+    invalidateDiskRosterCache();
     this.logger.info("threads.delete", {
       threadId: ref.threadId,
       sessionId: ref.sessionId,
@@ -1809,8 +1832,11 @@ export class DesktopHost {
     );
   }
 
-  historyLoad(sessionId: string): HistoryPage {
-    return loadChatHistory(sessionId, this.home);
+  historyLoad(
+    sessionId: string,
+    opts?: import("../shared/types.js").HistoryLoadOptions,
+  ): HistoryPage {
+    return loadChatHistory(sessionId, this.home, opts);
   }
 
   findSessionDir(sessionId: string): string | null {

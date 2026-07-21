@@ -15,6 +15,18 @@ export interface SessionMetaEntry {
   model?: string;
   /** 该会话推理力度 low|medium|high|xhigh */
   effort?: string;
+  /** 侧栏置顶（按 sessionId 持久化，disk/live 通用） */
+  pinned?: boolean;
+}
+
+function isEmptyMeta(entry: SessionMetaEntry): boolean {
+  return (
+    !entry.archived &&
+    !entry.title &&
+    !entry.model &&
+    !entry.effort &&
+    !entry.pinned
+  );
 }
 
 interface ThreadMetaFile {
@@ -77,7 +89,7 @@ export class ThreadMetaStore {
     } else if (data.sessions[sessionId]) {
       const next = { ...prev, archived: false };
       delete next.archivedAt;
-      if (!next.archived && !next.title) {
+      if (isEmptyMeta(next)) {
         delete data.sessions[sessionId];
       } else {
         data.sessions[sessionId] = next;
@@ -85,6 +97,26 @@ export class ThreadMetaStore {
     }
     this.write(data);
     return data.sessions[sessionId] ?? { archived: false };
+  }
+
+  isPinned(sessionId: string): boolean {
+    return this.get(sessionId).pinned === true;
+  }
+
+  setPinned(sessionId: string, pinned: boolean): SessionMetaEntry {
+    if (!sessionId) return {};
+    const data = this.read();
+    const prev = data.sessions[sessionId] ?? {};
+    if (pinned) {
+      data.sessions[sessionId] = { ...prev, pinned: true };
+    } else if (data.sessions[sessionId]) {
+      const next = { ...prev };
+      delete next.pinned;
+      if (isEmptyMeta(next)) delete data.sessions[sessionId];
+      else data.sessions[sessionId] = next;
+    }
+    this.write(data);
+    return data.sessions[sessionId] ?? {};
   }
 
   setTitle(sessionId: string, title: string): SessionMetaEntry {
@@ -95,7 +127,7 @@ export class ThreadMetaStore {
     if (!t) {
       const next = { ...prev };
       delete next.title;
-      if (!next.archived) delete data.sessions[sessionId];
+      if (isEmptyMeta(next)) delete data.sessions[sessionId];
       else data.sessions[sessionId] = next;
     } else {
       data.sessions[sessionId] = { ...prev, title: t };
@@ -129,12 +161,7 @@ export class ThreadMetaStore {
       else delete next.effort;
     }
     // 空条目清理
-    if (
-      !next.archived &&
-      !next.title &&
-      !next.model &&
-      !next.effort
-    ) {
+    if (isEmptyMeta(next)) {
       delete data.sessions[sessionId];
     } else {
       data.sessions[sessionId] = next;
@@ -170,12 +197,7 @@ export class ThreadMetaStore {
       const next: SessionMetaEntry = { ...entry };
       if (fb) next.model = fb;
       else delete next.model;
-      if (
-        !next.archived &&
-        !next.title &&
-        !next.model &&
-        !next.effort
-      ) {
+      if (isEmptyMeta(next)) {
         delete data.sessions[sid];
       } else {
         data.sessions[sid] = next;

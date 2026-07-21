@@ -4,6 +4,59 @@ import type { RosterEntry, Thread, ThreadStatus } from "../shared/types.js";
 import { cleanUserText, mapHistoryLine } from "./history.js";
 import { sessionsRoot } from "./paths.js";
 
+/** 磁盘会话扫描 TTL 缓存（listThreads 高频调用时避免反复 walk 全树） */
+const DISK_ROSTER_TTL_MS = 2500;
+type DiskRosterRow = {
+  sessionId: string;
+  sessionDir: string;
+  title: string;
+  cwd: string;
+  updatedAt: string;
+  sessionKind?: string;
+  parentSessionId?: string;
+  isSubagent: boolean;
+};
+let diskRosterCache: {
+  root: string;
+  at: number;
+  rows: DiskRosterRow[];
+} | null = null;
+
+/** 测试 / 写盘后可手动失效 */
+export function invalidateDiskRosterCache(): void {
+  diskRosterCache = null;
+}
+
+function loadDiskRosterRows(home?: string): DiskRosterRow[] {
+  const root = sessionsRoot(home);
+  const now = Date.now();
+  if (
+    diskRosterCache &&
+    diskRosterCache.root === root &&
+    now - diskRosterCache.at < DISK_ROSTER_TTL_MS
+  ) {
+    return diskRosterCache.rows;
+  }
+  const rows: DiskRosterRow[] = [];
+  if (fs.existsSync(root)) {
+    walkSessions(root, (sessionId, sessionDir, cwdHint) => {
+      const meta = readSessionMeta(sessionDir, sessionId, cwdHint);
+      rows.push({
+        sessionId,
+        sessionDir,
+        title: meta.title,
+        cwd: meta.cwd,
+        updatedAt: meta.updatedAt,
+        sessionKind: meta.sessionKind,
+        parentSessionId: meta.parentSessionId,
+        isSubagent: meta.isSubagent,
+      });
+    });
+  }
+  diskRosterCache = { root, at: now, rows };
+  return rows;
+}
+
 /**
  * Build Command Center roster: live threads + disk sessions projection.
  */
@@ -30,26 +83,22 @@ export function buildRoster(opts: {
     });
   }
 
-  // Disk sessions not already live
-  const root = sessionsRoot(opts.home);
-  if (fs.existsSync(root)) {
-    walkSessions(root, (sessionId, sessionDir, cwdHint) => {
-      if (liveBySession.has(sessionId)) return;
-      const meta = readSessionMeta(sessionDir, sessionId, cwdHint);
-      // /goal 会拉起 adversarial verifier / plan writer 等子会话，不当作用户对话
-      if (meta.isSubagent || isGoalInfraSession(meta.title, meta.sessionKind)) {
-        return;
-      }
-      entries.push({
-        sessionId,
-        title: meta.title,
-        cwd: meta.cwd,
-        status: "inactive" as ThreadStatus,
-        source: "disk",
-        updatedAt: meta.updatedAt,
-        sessionKind: meta.sessionKind,
-        parentSessionId: meta.parentSessionId,
-      });
+  // Disk sessions not already live（带短 TTL 缓存）
+  for (const row of loadDiskRosterRows(opts.home)) {
+    if (liveBySession.has(row.sessionId)) continue;
+    // /goal 会拉起 adversarial verifier / plan writer 等子会话，不当作用户对话
+    if (row.isSubagent || isGoalInfraSession(row.title, row.sessionKind)) {
+      continue;
+    }
+    entries.push({
+      sessionId: row.sessionId,
+      title: row.title,
+      cwd: row.cwd,
+      status: "inactive" as ThreadStatus,
+      source: "disk",
+      updatedAt: row.updatedAt,
+      sessionKind: row.sessionKind,
+      parentSessionId: row.parentSessionId,
     });
   }
 

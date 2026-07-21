@@ -4581,7 +4581,7 @@ async function dispatchAgentPrompt(
     }
   }
 
-  paintUserMessage(shown);
+  // 先连接再画用户气泡：避免 attach 失败留下「假已发送」消息
   showWelcome(false);
   beginTurn();
   setTurnStatus(tr("chat.connecting"));
@@ -4592,6 +4592,7 @@ async function dispatchAgentPrompt(
     appendLine(tr("chat.connectFail"), "error");
     return { ok: false, error: tr("chat.connectFail") };
   }
+  paintUserMessage(shown);
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   setTurnStatus(tr("turn.thinking"));
   const res = await inv("turns.prompt", {
@@ -4599,6 +4600,8 @@ async function dispatchAgentPrompt(
     content: agentText,
   });
   if (!res.ok) {
+    // prompt 未进 agent：标失败气泡，勿当作已成功发出
+    markLastUserMessageSendFailed();
     endTurn();
     // turn.completed(error) 可能已画过同一条；去重
     const errMsg = res.error?.message ?? tr("chat.sendFail");
@@ -4616,6 +4619,25 @@ async function dispatchAgentPrompt(
   void refreshContextUsage();
   void refreshProjectsAndThreads();
   return { ok: true };
+}
+
+/** turns.prompt 失败：给最近一条用户消息加失败态（不删，便于对照重发） */
+function markLastUserMessageSendFailed(): void {
+  const nodes = Array.from(
+    $("transcript").querySelectorAll(".user-msg-block"),
+  ) as HTMLElement[];
+  const last = nodes[nodes.length - 1];
+  if (!last) return;
+  last.classList.add("is-send-failed");
+  last.dataset.sendFailed = "1";
+  if (!last.querySelector(".msg-send-failed")) {
+    const tag = document.createElement("span");
+    tag.className = "msg-send-failed";
+    tag.textContent = tr("chat.sendFail") || "发送失败";
+    const meta = last.querySelector(".msg-user-meta");
+    if (meta) meta.appendChild(tag);
+    else last.appendChild(tag);
+  }
 }
 
 function bindSessionModeChips(): void {
@@ -7829,21 +7851,31 @@ async function openThread(t: ThreadRow): Promise<void> {
   }
   activeThreadId = t.id;
   activeSessionId = t.sessionId;
-  // 默认 history_only；若已有 live 附着则同步 pill（仍懒附着发送路径）
+  // 默认 history_only；按 sessionId 同步真实附着（disk_ 也可能已有 live）
   setAttachUiState("history_only");
-  if (t.id && !t.id.startsWith("disk_")) {
-    void inv<{
-      state?: string;
-      lastError?: string;
-    }>("threads.attachState", { threadId: t.id }).then((st) => {
-      if (viewGen !== sessionViewGen) return;
-      if (!st.ok || !st.data?.state) return;
-      const s = st.data.state as AttachState;
-      if (s === "live" || s === "attaching" || s === "failed") {
-        setAttachUiState(s, st.data.lastError);
-      }
-    });
-  }
+  void inv<{
+    threadId?: string;
+    state?: string;
+    lastError?: string;
+  }>("threads.attachState", {
+    threadId: t.id.startsWith("disk_") ? undefined : t.id,
+    sessionId: t.sessionId,
+  }).then((st) => {
+    if (viewGen !== sessionViewGen) return;
+    if (!st.ok || !st.data?.state) return;
+    const s = st.data.state as AttachState;
+    if (s === "live" || s === "attaching" || s === "failed") {
+      setAttachUiState(s, st.data.lastError);
+    }
+    // 列表是 disk_ 但 Host 已 live：回写 live threadId，事件路由更准
+    if (
+      st.data.threadId &&
+      (s === "live" || s === "attaching") &&
+      activeThreadId?.startsWith("disk_")
+    ) {
+      activeThreadId = st.data.threadId;
+    }
+  });
   // L1 按会话加载持久队列（勿静默清空）
   void reloadPromptQueueFromHost();
   setActiveCwd(t.cwd);
@@ -7876,9 +7908,17 @@ async function openThread(t: ThreadRow): Promise<void> {
         toolInput?: unknown;
         toolOutput?: unknown;
       }>;
+      truncated?: boolean;
     }>("history.load", { sessionId: t.sessionId });
     // 快速切换：丢弃过期回放，避免画进错误会话
     if (viewGen !== sessionViewGen) return;
+    if (hist.data?.truncated) {
+      showToast(
+        tr("history.truncated") ||
+          "历史过长，仅显示较新片段（完整内容仍在磁盘）",
+        "info",
+      );
+    }
     const userTexts: string[] = [];
     // S15：连贯回放 — user / thought / tool / assistant 同一时间线
     for (const e of hist.data?.entries ?? []) {

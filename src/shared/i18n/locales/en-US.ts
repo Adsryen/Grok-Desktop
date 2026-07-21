@@ -1034,6 +1034,8 @@ export const enUS: MessageDict = {
   "history.inserted": "Inserted into composer",
   /** P0-A: light history-load marker (idle = send ↑) */
   "history.replayDone": "History loaded · {n} entries",
+  "history.truncated":
+    "History is large; showing recent portion only (full transcript remains on disk)",
 
   // ── goal toasts ────────────────────────────────────────
   "goal.blocked": "Goal blocked",

@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { HistoryEntry, HistoryPage } from "../shared/types.js";
+import type {
+  HistoryEntry,
+  HistoryLoadOptions,
+  HistoryPage,
+} from "../shared/types.js";
 import { findSessionDir } from "./paths.js";
+
+/** 默认：最多 3000 条 UI 条目，最多读尾部 12MiB（防巨型 jsonl 卡死 Host） */
+export const HISTORY_DEFAULT_MAX_ENTRIES = 3000;
+export const HISTORY_DEFAULT_MAX_BYTES = 12 * 1024 * 1024;
 
 /**
  * Parse grok chat_history.jsonl into UI-facing timeline entries.
@@ -9,11 +17,22 @@ import { findSessionDir } from "./paths.js";
  * - tool_call + tool_result → role:tool（与直播过程块同源回放）
  * - reasoning / thought → role:thought（过程块回放，S15）
  * - system 仍跳过（噪声）
+ * - 超大文件：只读尾部字节，展开后若超 maxEntries 则保留较新部分
  */
 export function loadChatHistory(
   sessionId: string,
   home?: string,
+  opts?: HistoryLoadOptions,
 ): HistoryPage {
+  const maxEntries =
+    opts?.maxEntries != null && Number.isFinite(opts.maxEntries)
+      ? Math.max(1, Math.floor(opts.maxEntries))
+      : HISTORY_DEFAULT_MAX_ENTRIES;
+  const maxBytes =
+    opts?.maxBytes != null && Number.isFinite(opts.maxBytes)
+      ? Math.max(1024, Math.floor(opts.maxBytes))
+      : HISTORY_DEFAULT_MAX_BYTES;
+
   const sessionDir = findSessionDir(sessionId, home);
   const entries: HistoryEntry[] = [];
   if (!sessionDir) {
@@ -31,8 +50,13 @@ export function loadChatHistory(
     { name: string; input?: unknown }
   >();
 
-  const raw = fs.readFileSync(historyFile, "utf8");
-  for (const line of raw.split(/\r?\n/)) {
+  const { text, truncatedBytes, sourceLineCount } = readHistoryText(
+    historyFile,
+    maxBytes,
+  );
+  let truncated = truncatedBytes;
+
+  for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let obj: Record<string, unknown>;
     try {
@@ -57,7 +81,50 @@ export function loadChatHistory(
     });
   }
 
-  return { sessionId, entries, sessionDir };
+  // 条数上限：保留较新部分（数组尾部）
+  let out = entries;
+  if (out.length > maxEntries) {
+    out = out.slice(out.length - maxEntries);
+    truncated = true;
+  }
+
+  return {
+    sessionId,
+    entries: out,
+    sessionDir,
+    truncated: truncated || undefined,
+    sourceLineCount,
+  };
+}
+
+/**
+ * 读取 history 文件；超 maxBytes 时只读尾部，并丢掉首行半截 JSON。
+ */
+export function readHistoryText(
+  historyFile: string,
+  maxBytes: number,
+): { text: string; truncatedBytes: boolean; sourceLineCount: number } {
+  const st = fs.statSync(historyFile);
+  const size = st.size;
+  if (size <= maxBytes) {
+    const text = fs.readFileSync(historyFile, "utf8");
+    const sourceLineCount = text.split(/\r?\n/).filter((l) => l.trim()).length;
+    return { text, truncatedBytes: false, sourceLineCount };
+  }
+
+  const fd = fs.openSync(historyFile, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    fs.readSync(fd, buf, 0, maxBytes, size - maxBytes);
+    let text = buf.toString("utf8");
+    // 尾部切片可能从半行开始：丢掉第一行
+    const nl = text.indexOf("\n");
+    if (nl >= 0) text = text.slice(nl + 1);
+    const sourceLineCount = text.split(/\r?\n/).filter((l) => l.trim()).length;
+    return { text, truncatedBytes: true, sourceLineCount };
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** 将单行 history 展开为 0..n 条 UI 条目 */

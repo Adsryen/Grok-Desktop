@@ -608,6 +608,24 @@ describe("saveQueue roundtrip", () => {
   });
 });
 
+describe("P1 pin + roster cache", () => {
+  it("threadsPin works for disk_ session and persists", () => {
+    const home = tempHome();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cwd-pin-"));
+    homes.push(cwd);
+    const sid = "sess_pin_disk";
+    plantSession(home, sid, cwd);
+    const host = trackHost(new DesktopHost({ home }));
+    const snap = host.threadsPin(`disk_${sid}`, true);
+    expect(snap.pinned).toBe(true);
+    expect(host.threadMeta.isPinned(sid)).toBe(true);
+    const listed = host.listThreads().find((t) => t.sessionId === sid);
+    expect(listed?.pinned).toBe(true);
+    host.threadsPin(`disk_${sid}`, false);
+    expect(host.threadMeta.isPinned(sid)).toBe(false);
+  });
+});
+
 describe("threadsAttach inflight + queue cleanup on delete", () => {
   it("concurrent attach same session returns same threadId", async () => {
     const home = tempHome();

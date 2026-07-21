@@ -1056,6 +1056,7 @@ export const zhCN = {
 
   /** P0-A：历史回放弱提示（空闲由发送钮 ↑ 表达） */
   "history.replayDone": "已加载历史 · {n} 条",
+  "history.truncated": "历史过长，仅显示较新片段（完整内容仍在磁盘）",
 
   "search.resumeHint": "搜索项目 / 对话 / 符号；输入 session id 可精确 resume（对齐 CLI -r）",
   "search.placeholder": "搜索项目 / 对话 / session id / 符号…",

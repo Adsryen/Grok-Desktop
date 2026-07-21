@@ -182,6 +182,18 @@ export interface HistoryPage {
   entries: HistoryEntry[];
   cursor?: string;
   sessionDir?: string | null;
+  /** 因体积/条数上限截断（仅保留较新部分） */
+  truncated?: boolean;
+  /** jsonl 非空行数（截断前估算） */
+  sourceLineCount?: number;
+}
+
+/** history.load 可选保护参数 */
+export interface HistoryLoadOptions {
+  /** 最多展开 UI 条目（默认 3000） */
+  maxEntries?: number;
+  /** 最多读取文件尾部字节（默认 12MiB） */
+  maxBytes?: number;
 }
 
 /** Roster row for Command Center (top-level agents only). */
