@@ -34,6 +34,8 @@ npm run dev
 | `npm run sync:agent` | 复制二进制并写 `agent-bin/VERSION.txt` |
 | `npm run check:agent` | 打包前检查 agent 是否存在且体积合理 |
 | `npm run dist:win` | 构建并打 Windows 安装包（含 check） |
+| `npm run dist:mac` | 仅在 macOS：arm64 dmg+zip（未签名；CI 见 `release-mac`） |
+| `npm run fetch:agent` | 从官方 CDN 拉 grok 到 `agent-bin/` |
 
 ## 分支（方案 A / GitHub Flow）
 

@@ -14,11 +14,13 @@
     "start": "npm run build && electron .",
     "dev": "tsx src/bin/host-smoke.ts",
     "sync:agent": "node scripts/sync-agent-bin.mjs",
+    "fetch:agent": "node scripts/fetch-agent-bin.mjs",
     "check:agent": "node scripts/check-agent-bin.mjs",
     "check:main-clean": "node scripts/check-main-clean.mjs",
     "pack": "npm run build && node scripts/check-agent-bin.mjs && electron-builder --dir",
     "dist": "npm run build && node scripts/check-agent-bin.mjs && electron-builder",
-    "dist:win": "npm run build && node scripts/check-agent-bin.mjs && electron-builder --win"
+    "dist:win": "npm run build && node scripts/check-agent-bin.mjs && electron-builder --win --publish never",
+    "dist:mac": "npm run build && node scripts/check-agent-bin.mjs && electron-builder --mac --publish never"
   },
   "engines": {
     "node": ">=20"
@@ -93,11 +95,24 @@
     },
     "mac": {
       "target": [
-        "dmg",
-        "dir"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
       "category": "public.app-category.developer-tools",
-      "icon": "assets/icon.png"
+      "icon": "assets/icon.png",
+      "artifactName": "GrokDesktop-${version}-${os}-${arch}.${ext}",
+      "identity": null,
+      "gatekeeperAssess": false
     },
     "linux": {
       "target": [

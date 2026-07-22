@@ -1,0 +1,132 @@
+# 在 macOS runner 上打 arm64 安装包（dmg + zip），并可选上传到 GitHub Release。
+# 维护者无 Mac 时的正式渠道；agent 从官方 CDN 拉取（不入库）。
+#
+# 触发：
+#   - workflow_dispatch（手动，可只构建或构建并上传）
+#   - push tags v*（构建并上传到对应 Release）
+name: release-mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: "Upload artifacts to GitHub Release for this ref/tag"
+        type: boolean
+        default: false
+      agent_version:
+        description: "Grok agent version (empty = channel stable latest)"
+        type: string
+        required: false
+        default: ""
+      agent_channel:
+        description: "Agent channel when version empty"
+        type: string
+        required: false
+        default: "stable"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch official macOS agent (arm64)
+        env:
+          AGENT_VERSION: ${{ github.event.inputs.agent_version || '' }}
+          AGENT_CHANNEL: ${{ github.event.inputs.agent_channel || 'stable' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${AGENT_VERSION}" ]; then
+            npm run fetch:agent -- --platform macos --arch aarch64 --version "${AGENT_VERSION}"
+          else
+            npm run fetch:agent -- --platform macos --arch aarch64 --channel "${AGENT_CHANNEL}"
+          fi
+          npm run check:agent
+          ls -lh agent-bin/
+          cat agent-bin/VERSION.txt || true
+
+      - name: Build macOS packages (unsigned arm64 dmg + zip)
+        env:
+          # 无 Apple 证书：禁止自动 codesign
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:mac
+
+      - name: List release artifacts
+        run: |
+          set -euo pipefail
+          ls -lh release/ || true
+          find release -maxdepth 2 -type f \( -name '*.dmg' -o -name '*.zip' -o -name 'latest-mac*.yml' -o -name '*.blockmap' \) -print
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm64-${{ github.ref_name }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac*.yml
+            release/*.blockmap
+            agent-bin/VERSION.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Resolve whether to upload to GitHub Release
+        id: release
+        run: |
+          set -euo pipefail
+          upload=false
+          if [ "${{ github.event_name }}" = "push" ] && [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            upload=true
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.upload_release }}" = "true" ]; then
+            upload=true
+          fi
+          echo "upload=${upload}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            # 手动跑在分支上：用 package.json version 推断 tag 名（需 Release 已存在或随后创建）
+            ver=$(node -p "require('./package.json').version")
+            echo "tag=v${ver}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to GitHub Release
+        if: steps.release.outputs.upload == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*.dmg release/*.zip release/latest-mac*.yml release/*.blockmap)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No mac artifacts to upload" >&2
+            exit 1
+          fi
+          echo "Uploading to release ${TAG}: ${files[*]}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${files[@]}" --clobber
+          else
+            gh release create "${TAG}" "${files[@]}" \
+              --title "${TAG}" \
+              --notes "macOS arm64 build from CI (${{ github.sha }}). Unsigned — open via Finder: right-click → Open." \
+              --latest=false
+          fi
+          gh release view "${TAG}"
