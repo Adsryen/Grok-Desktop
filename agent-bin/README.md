@@ -10,25 +10,28 @@
 ## 放置方式
 
 ```bash
-# 从本机 CLI 同步（推荐）
+# 从本机 CLI 同步
 npm run sync:agent
 
 # 指定来源
 npm run sync:agent -- --from /path/to/grok
 
-# 或手动复制后再 sync 一次以写 VERSION（或手写 VERSION.txt）
+# 从官方 CDN 拉取（CI / 指定平台）
+npm run fetch:agent -- --platform windows --arch x86_64
+npm run fetch:agent -- --platform macos --arch aarch64
 ```
 
-只复制 **程序文件**，不要复制 `~/.grok` / `~/.grok-desktop` 配置或会话目录。
+只复制 **程序文件**，不要复制 `~/.grok` / `~/.grok-desktop` 配置或会话目录。  
+**按平台分别准备**：Win 包需要 `grok.exe`，Mac 包需要 `grok`（darwin），不要混用。
 
 ## Git
 
 默认 **不入库**（体积大）。目录占位用 `.gitkeep`。  
-发版机本地保留 `agent-bin/grok*` 与 `VERSION.txt` 后再 `npm run dist:win`。
+发版机 / CI 保留对应平台二进制与 `VERSION.txt` 后再 `dist:win` / `dist:mac`。
 
 ## 运行时
 
 - 开发：`agent-bin/grok.exe`（或 `grok`）
-- 安装包：`resources/agent/grok.exe`（由 electron-builder 从本目录打包，含 VERSION.txt）
+- 安装包：`resources/agent/grok[.exe]`（由 electron-builder 从本目录打包，含 VERSION.txt）
 
 设置 → 关于 会展示路径、`grok --version` 与 VERSION 元数据。
