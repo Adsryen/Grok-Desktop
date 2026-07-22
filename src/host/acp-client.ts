@@ -1,4 +1,5 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import readline from "node:readline";
 import { HostError } from "../shared/errors.js";
 import type { NormalizedEvent } from "../shared/events.js";
@@ -162,6 +163,47 @@ export class AcpClient {
   private hadToolFailuresThisTurn = false;
   /** Last tool failure text for UI. */
   private lastToolFailureThisTurn: string | null = null;
+  /**
+   * RPC id of the in-flight `session/prompt` (if any).
+   * cancel() rejects this so Host does not hang on a cancelled turn.
+   */
+  private activePromptRpcId: JsonRpcId | null = null;
+  /**
+   * Client-generated prompt id for the in-flight turn (CLI cancelPromptId).
+   * Sent on session/cancel `_meta` so agent can attribute cancel delivery.
+   */
+  private activeClientPromptId: string | null = null;
+  /**
+   * Monotonic generation for each session/prompt.
+   * cancel() bumps it so late agent stdout from a cancelled turn never
+   * paints into the next user prompt (cross-turn bleed).
+   * Isolation is generation-gate only (CLI-aligned) — no content poison filter.
+   */
+  private promptGeneration = 0;
+  /** Generation currently accepted for stream/tool events (0 = none). */
+  private activePromptGeneration = 0;
+  /** True while the current generation was cancelled (redundant with gen mismatch). */
+  private turnCancelled = false;
+  /** Serialize cancel so prompt() waits for in-flight cancel to finish. */
+  private cancelInFlight: Promise<void> | null = null;
+  /**
+   * Last time we saw assistant/tool stream traffic (even if dropped).
+   * Brief quiet after cancel; no multi-second drain (CLI cancels without long wait).
+   */
+  private lastStreamAtMs = 0;
+  /**
+   * Only forward stream/tool after this prompt generation was written to agent.
+   * 0 = drop all stream (between prompts / after cancel).
+   */
+  private streamAcceptGeneration = 0;
+  /** When the current session/prompt was written to agent stdin. */
+  private promptWireAtMs = 0;
+  /** Last cancel() finish time — next prompt may brief-settle first. */
+  private lastCancelAtMs = 0;
+  /** Generation for which turn.started was already emitted (gate open). */
+  private turnStartedEmittedGen = 0;
+  /** Tool call ids seen while gate was closed — never re-paint after open. */
+  private residualToolCallIds = new Set<string>();
   private permissionWaiters = new Map<
     string,
     {
@@ -204,6 +246,11 @@ export class AcpClient {
 
   get capabilities(): GrokCapabilities {
     return { ...this.agentCaps };
+  }
+
+  /** 是否有未结束的 session/prompt（切回会话 rehydrate 真源） */
+  isPromptInFlight(): boolean {
+    return this.activePromptRpcId != null && !this.turnCancelled;
   }
 
   /** Mode B liveness: process still running. */
@@ -351,40 +398,120 @@ export class AcpClient {
     return this.sessionId;
   }
 
+  /** Wait until agent stops emitting stream/tool (or maxMs). */
+  private async waitStreamQuiet(
+    quietMs = 600,
+    maxMs = 4_000,
+  ): Promise<void> {
+    const start = Date.now();
+    // If we never saw stream, still brief yield so cancel can flush
+    if (this.lastStreamAtMs <= 0) {
+      await new Promise((r) => setTimeout(r, 120));
+      return;
+    }
+    while (Date.now() - start < maxMs) {
+      const idle = Date.now() - this.lastStreamAtMs;
+      if (idle >= quietMs) return;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  }
+
+  /**
+   * Open the stream gate for this prompt generation and emit turn.started once.
+   * Call only after session/prompt is on the wire; residual T1 is dropped by
+   * generation mismatch (no content-level poison filter).
+   */
+  private openStreamGate(gen: number): void {
+    if (
+      this.turnCancelled ||
+      this.activePromptGeneration !== gen ||
+      gen <= 0
+    ) {
+      return;
+    }
+    this.streamAcceptGeneration = gen;
+    if (this.turnStartedEmittedGen === gen) return;
+    this.turnStartedEmittedGen = gen;
+    this.opts.onEvent({
+      type: "turn.started",
+      threadId: this.opts.threadId,
+      sessionId: this.sessionId ?? "",
+    });
+    this.opts.onEvent({
+      type: "session.status",
+      threadId: this.opts.threadId,
+      sessionId: this.sessionId ?? "",
+      status: "working",
+    });
+  }
+
   async prompt(text: string): Promise<{ stopReason?: string }> {
     if (!this.sessionId) {
       throw new HostError("NOT_ATTACHED", "No ACP session attached");
     }
 
+    // Wait out any cancel; never stack a new prompt on a half-dead turn
+    if (this.cancelInFlight) {
+      await this.cancelInFlight;
+    }
+    if (this.activePromptRpcId != null) {
+      await this.cancel();
+    }
+    // After cancel notification, ensure residual T1 is quiet before new prompt
+    if (this.lastCancelAtMs > 0 && Date.now() - this.lastCancelAtMs < 5_000) {
+      await this.waitStreamQuiet(300, 3_000);
+    }
+
+    // New user prompt: invalidate any cancelled turn's late stdout
+    this.promptGeneration += 1;
+    const myGen = this.promptGeneration;
+    this.activePromptGeneration = myGen;
+    // Drop all stream until this prompt is on the wire + short settle
+    this.streamAcceptGeneration = 0;
+    this.promptWireAtMs = 0;
+    this.turnStartedEmittedGen = 0;
     this.streamedAssistantThisTurn = false;
     this.hadToolActivityThisTurn = false;
     this.hadToolFailuresThisTurn = false;
     this.lastToolFailureThisTurn = null;
-    this.opts.onEvent({
-      type: "turn.started",
-      threadId: this.opts.threadId,
-      sessionId: this.sessionId,
-    });
-    this.opts.onEvent({
-      type: "session.status",
-      threadId: this.opts.threadId,
-      sessionId: this.sessionId,
-      status: "working",
-    });
+    this.residualToolCallIds.clear();
+    this.turnCancelled = false;
+    this.activePromptRpcId = null;
+    // Client prompt id for cancel `_meta.cancelPromptId` (CLI-aligned)
+    const clientPromptId = `p_${randomUUID()}`;
+    this.activeClientPromptId = clientPromptId;
+    // turn.started deferred until openStreamGate() after write + short settle
 
     try {
       // Idle-reset (#5) + turn.completed metadata for UI settle UX (#6).
+      // streamAcceptGeneration / turn.started set inside request() after write.
       const result = (await this.request(
         "session/prompt",
         {
           sessionId: this.sessionId,
           prompt: [{ type: "text", text }],
+          _meta: { promptId: clientPromptId },
         },
         { idleMs: 15 * 60_000, maxMs: 2 * 60 * 60_000 },
+        { trackAsPrompt: true, acceptStreamGeneration: myGen },
       )) as { stopReason?: string; stop_reason?: string; text?: string };
 
+      // Stale: cancel() or a newer prompt superseded this generation
+      if (myGen !== this.activePromptGeneration || this.turnCancelled) {
+        return { stopReason: "cancelled" };
+      }
+
       // Only emit final text if no streaming chunks were received (avoid duplicate full paste)
-      if (result?.text && !this.streamedAssistantThisTurn) {
+      if (
+        result?.text &&
+        !this.streamedAssistantThisTurn &&
+        myGen === this.activePromptGeneration &&
+        !this.turnCancelled
+      ) {
+        if (this.turnStartedEmittedGen !== myGen) {
+          this.openStreamGate(myGen);
+        }
+        this.streamedAssistantThisTurn = true;
         this.opts.onEvent({
           type: "message.delta",
           threadId: this.opts.threadId,
@@ -394,11 +521,17 @@ export class AcpClient {
         });
       }
 
+      // Re-check after await: cancel may have raced in
+      if (myGen !== this.activePromptGeneration || this.turnCancelled) {
+        return { stopReason: "cancelled" };
+      }
+
+      const rawStop = result?.stopReason ?? result?.stop_reason;
       this.opts.onEvent({
         type: "turn.completed",
         threadId: this.opts.threadId,
         sessionId: this.sessionId,
-        stopReason: result?.stopReason ?? result?.stop_reason,
+        stopReason: rawStop,
         hadAssistantText:
           this.streamedAssistantThisTurn || Boolean(result?.text),
         hadToolActivity: this.hadToolActivityThisTurn,
@@ -418,6 +551,14 @@ export class AcpClient {
         err && typeof err === "object" && "code" in err
           ? String((err as { code?: string }).code ?? "")
           : "";
+      // cancel() rejects prompt with CANCELLED — already emitted turn.completed
+      if (
+        code === "CANCELLED" ||
+        this.turnCancelled ||
+        myGen !== this.activePromptGeneration
+      ) {
+        return { stopReason: "cancelled" };
+      }
       const stopReason =
         code === "TIMEOUT" || /timed out/i.test(message) ? "timeout" : "error";
       this.opts.onEvent({
@@ -438,16 +579,156 @@ export class AcpClient {
         status: "failed",
       });
       throw err;
+    } finally {
+      // Close stream gate for this generation
+      if (this.streamAcceptGeneration === myGen) {
+        this.streamAcceptGeneration = 0;
+      }
+      // Do not zero activePromptGeneration: cancel may have advanced it for isolation
+      if (myGen === this.activePromptGeneration) {
+        this.activePromptRpcId = null;
+        if (this.activeClientPromptId === clientPromptId) {
+          this.activeClientPromptId = null;
+        }
+      }
     }
   }
 
-  async cancel(): Promise<void> {
+  /**
+   * Cancel the in-flight turn (user Stop / Esc / send_now).
+   * Aligns with CLI `session/cancel` + `_meta`:
+   * - cancelSubagents: true (stop nested agents)
+   * - cancelTrigger: "stop" | "esc" | "send_now" | …
+   * - cancelPromptId: client prompt id of the cancelled turn (when known)
+   * - rewindIfPristine: false by default
+   * Concurrent cancel() joins the same in-flight promise (retry-safe Cancelling).
+   */
+  async cancel(opts?: {
+    /** CLI cancelTrigger: stop button, esc, send_now, … */
+    trigger?: string;
+    /** Override cancelPromptId; default = in-flight client prompt id */
+    cancelPromptId?: string;
+  }): Promise<void> {
     if (!this.sessionId) return;
-    try {
-      await this.request("session/cancel", { sessionId: this.sessionId });
-    } catch (err) {
-      this.opts.logger?.warn("acp.cancel_failed", { err: String(err) });
+    if (this.cancelInFlight) {
+      await this.cancelInFlight;
+      return;
     }
+    const trigger = opts?.trigger?.trim() || "stop";
+    const cancelPromptId =
+      opts?.cancelPromptId?.trim() || this.activeClientPromptId || undefined;
+    this.cancelInFlight = this.runCancel(trigger, cancelPromptId).finally(
+      () => {
+        this.cancelInFlight = null;
+      },
+    );
+    await this.cancelInFlight;
+  }
+
+  private async runCancel(
+    trigger: string,
+    cancelPromptId?: string,
+  ): Promise<void> {
+    if (!this.sessionId) return;
+    this.turnCancelled = true;
+    // Invalidate current generation so late stdout cannot attach to next prompt
+    this.promptGeneration += 1;
+    this.activePromptGeneration = this.promptGeneration;
+    // Hard-close stream gate (T1 tokens must not pass until next prompt is on wire)
+    this.streamAcceptGeneration = 0;
+    this.turnStartedEmittedGen = 0;
+
+    // Abort local wait on session/prompt immediately (do not wait for agent).
+    // Emit turn.completed once — UI also endTurns optimistically; renderer
+    // ignores duplicate cancelled settle while stop-suppressed.
+    const promptId = this.activePromptRpcId;
+    let settled = false;
+    if (promptId != null) {
+      const pending = this.pending.get(promptId);
+      if (pending) {
+        const entry = this.pendingTimers.get(promptId);
+        if (entry) clearTimeout(entry.timer);
+        this.pendingTimers.delete(promptId);
+        this.pending.delete(promptId);
+        this.activePromptRpcId = null;
+        this.opts.onEvent({
+          type: "turn.completed",
+          threadId: this.opts.threadId,
+          sessionId: this.sessionId,
+          stopReason: "cancelled",
+          hadAssistantText: this.streamedAssistantThisTurn,
+          hadToolActivity: this.hadToolActivityThisTurn,
+          hadToolFailures: this.hadToolFailuresThisTurn,
+          lastToolFailure: this.lastToolFailureThisTurn ?? undefined,
+        });
+        this.opts.onEvent({
+          type: "session.status",
+          threadId: this.opts.threadId,
+          sessionId: this.sessionId,
+          status: "idle",
+        });
+        settled = true;
+        pending.reject(
+          new HostError("CANCELLED", "Turn cancelled by user"),
+        );
+      } else {
+        this.activePromptRpcId = null;
+      }
+    }
+    if (!settled) {
+      this.opts.onEvent({
+        type: "turn.completed",
+        threadId: this.opts.threadId,
+        sessionId: this.sessionId,
+        stopReason: "cancelled",
+        hadAssistantText: this.streamedAssistantThisTurn,
+        hadToolActivity: this.hadToolActivityThisTurn,
+        hadToolFailures: this.hadToolFailuresThisTurn,
+        lastToolFailure: this.lastToolFailureThisTurn ?? undefined,
+      });
+      this.opts.onEvent({
+        type: "session.status",
+        threadId: this.opts.threadId,
+        sessionId: this.sessionId,
+        status: "idle",
+      });
+    }
+
+    /**
+     * ROOT CAUSE FIX (2026-07-22 host logs):
+     * ACP `session/cancel` is a **notification** (`CancelNotification`), not a
+     * request. Sending `{id, method:"session/cancel"}` makes real `grok agent`
+     * answer **Method not found** — cancel never runs, T1 keeps generating,
+     * and T2 (e.g. 苹果) mixes with 玻璃. CLI sends CancelNotification (no id).
+     */
+    const meta: Record<string, unknown> = {
+      cancelSubagents: true,
+      cancelTrigger: trigger,
+      rewindIfPristine: false,
+    };
+    if (cancelPromptId) meta.cancelPromptId = cancelPromptId;
+    this.opts.logger?.info("acp.cancel", {
+      sessionId: this.sessionId,
+      trigger,
+      cancelPromptId: cancelPromptId ?? null,
+      promptGen: this.promptGeneration,
+      streamAcceptGen: this.streamAcceptGeneration,
+      wire: "notification",
+    });
+    try {
+      this.notify("session/cancel", {
+        sessionId: this.sessionId,
+        _meta: meta,
+      });
+    } catch (err) {
+      this.opts.logger?.warn("acp.cancel_notify_failed", { err: String(err) });
+    }
+    this.activeClientPromptId = null;
+    // Cancel is fire-and-forget on agent; wait until residual T1 traffic quiets
+    // before the next session/prompt (abort is async after the notification).
+    await this.waitStreamQuiet(400, 4_000);
+    this.lastCancelAtMs = Date.now();
+    this.streamAcceptGeneration = 0;
   }
 
   /**
@@ -498,12 +779,14 @@ export class AcpClient {
   }
 
   /**
-   * 完整回退：对话 + 文件（mode=all）。
-   * targetPromptIndex：恢复到该 user prompt **执行前**（丢弃 index 及之后）。
+   * 回退到 targetPromptIndex 执行前（丢弃 index 及之后）。
+   * - mode=all：对话+文件（默认，UI 完整 rewind）
+   * - mode=conversation_only：只砍 agent 对话上下文，不动文件
+   *   （Stop 后下一题隔离：UI 仍显示被停轮，agent 不再续写）
    */
   async rewindExecute(
     targetPromptIndex: number,
-    opts?: { force?: boolean },
+    opts?: { force?: boolean; mode?: "all" | "conversation_only" | "files_only" },
   ): Promise<{
     success: boolean;
     target_prompt_index: number;
@@ -520,6 +803,12 @@ export class AcpClient {
     if (!Number.isFinite(targetPromptIndex) || targetPromptIndex < 0) {
       throw new HostError("INVALID_ARGUMENT", "invalid targetPromptIndex");
     }
+    const mode =
+      opts?.mode === "conversation_only"
+        ? "conversation_only"
+        : opts?.mode === "files_only"
+          ? "files_only"
+          : "all";
     const result = (await this.extMethod(
       "_x.ai/rewind/execute",
       {
@@ -527,7 +816,7 @@ export class AcpClient {
         targetPromptIndex,
         // agent：false=dry-run 预览；true=真正执行
         force: opts?.force === true,
-        mode: "all",
+        mode,
       },
       120_000,
     )) as Record<string, unknown>;
@@ -1141,11 +1430,14 @@ export class AcpClient {
    * @param timeout
    *   number = fixed wall-clock ms (legacy)
    *   object = idle-reset timeout (resets on any ACP line while pending)
+   * @param opts.trackAsPrompt — mark RPC as active session/prompt for cancel()
+   * @param opts.acceptStreamGeneration — after write, accept stream only for this gen
    */
   private request(
     method: string,
     params: unknown,
     timeout: number | { idleMs?: number; maxMs?: number } = 120_000,
+    opts?: { trackAsPrompt?: boolean; acceptStreamGeneration?: number },
   ): Promise<unknown> {
     const id = this.nextId++;
     const idleMs =
@@ -1157,12 +1449,22 @@ export class AcpClient {
         ? timeout
         : Math.max(idleMs, Number(timeout?.maxMs) || idleMs);
     const startedAt = Date.now();
+    if (opts?.trackAsPrompt) {
+      this.activePromptRpcId = id;
+    }
     return new Promise((resolve, reject) => {
       const fire = () => {
         const entry = this.pendingTimers.get(id);
         if (entry) clearTimeout(entry.timer);
         this.pendingTimers.delete(id);
         this.pending.delete(id);
+        if (this.activePromptRpcId === id) this.activePromptRpcId = null;
+        if (
+          opts?.acceptStreamGeneration != null &&
+          this.streamAcceptGeneration === opts.acceptStreamGeneration
+        ) {
+          this.streamAcceptGeneration = 0;
+        }
         reject(
           new HostError(
             "TIMEOUT",
@@ -1189,16 +1491,59 @@ export class AcpClient {
           const entry = this.pendingTimers.get(id);
           if (entry) clearTimeout(entry.timer);
           this.pendingTimers.delete(id);
+          if (this.activePromptRpcId === id) this.activePromptRpcId = null;
+          if (
+            opts?.acceptStreamGeneration != null &&
+            this.streamAcceptGeneration === opts.acceptStreamGeneration
+          ) {
+            this.streamAcceptGeneration = 0;
+          }
           resolve(v);
         },
         reject: (e) => {
           const entry = this.pendingTimers.get(id);
           if (entry) clearTimeout(entry.timer);
           this.pendingTimers.delete(id);
+          if (this.activePromptRpcId === id) this.activePromptRpcId = null;
+          if (
+            opts?.acceptStreamGeneration != null &&
+            this.streamAcceptGeneration === opts.acceptStreamGeneration
+          ) {
+            this.streamAcceptGeneration = 0;
+          }
           reject(e);
         },
       });
       this.write({ jsonrpc: "2.0", id, method, params });
+      // After write: brief settle then open gate. Isolation is generation-only;
+      // never wait for stream quiet (that hung UI on 思考中 after cancel→新问题).
+      if (
+        opts?.acceptStreamGeneration != null &&
+        opts.acceptStreamGeneration > 0
+      ) {
+        const gen = opts.acceptStreamGeneration;
+        this.streamAcceptGeneration = 0;
+        this.promptWireAtMs = Date.now();
+        const afterRecentCancel =
+          this.lastCancelAtMs > 0 &&
+          Date.now() - this.lastCancelAtMs < 8_000;
+        // Generation mismatch already drops T1. Only brief settle after cancel
+        // so residual frames stay behind the closed gate; 0ms otherwise so
+        // first thought/message chunks are not lost (fake + real agent).
+        const minSettleMs = afterRecentCancel ? 100 : 0;
+        const openGate = () => {
+          if (
+            this.turnCancelled ||
+            this.activePromptGeneration !== gen ||
+            this.activePromptRpcId !== id
+          ) {
+            return;
+          }
+          this.openStreamGate(gen);
+        };
+        if (minSettleMs <= 0) openGate();
+        else setTimeout(openGate, minSettleMs);
+      }
     });
   }
 
@@ -1256,6 +1601,7 @@ export class AcpClient {
     if ("id" in msg && (msg.result !== undefined || msg.error !== undefined)) {
       const id = msg.id as JsonRpcId;
       const pending = this.pending.get(id);
+      // Late response after cancel() already rejected the prompt — ignore
       if (!pending) return;
       this.pending.delete(id);
       if (msg.error) {
@@ -1295,6 +1641,53 @@ export class AcpClient {
       const update = (params.update ?? params) as Record<string, unknown>;
       const sid = (params.sessionId as string) ?? this.sessionId ?? "unknown";
       for (const ev of normalizeSessionUpdate(this.opts.threadId, sid, update)) {
+        // Stream/tool only while the *current* prompt is on the wire.
+        // activePromptRpcId alone is NOT enough: after T1 cancel + T2 prompt,
+        // leftover T1 session/update still arrives and would glue into T2.
+        // streamAcceptGeneration is set only after session/prompt is written,
+        // and cleared on cancel / prompt settle.
+        const isStreamOrTool =
+          ev.type === "message.delta" ||
+          ev.type === "thought.delta" ||
+          ev.type === "tool.started" ||
+          ev.type === "tool.completed";
+        if (isStreamOrTool) {
+          this.lastStreamAtMs = Date.now();
+          // Track tool ids seen while gate closed — residual T1 tools
+          if (
+            (ev.type === "tool.started" || ev.type === "tool.completed") &&
+            (this.streamAcceptGeneration === 0 ||
+              this.turnCancelled ||
+              this.streamAcceptGeneration !== this.activePromptGeneration)
+          ) {
+            const tid = String(
+              (ev as { toolCallId?: string }).toolCallId ?? "",
+            ).trim();
+            if (tid) this.residualToolCallIds.add(tid);
+          }
+
+          // Generation gate only (CLI-aligned). No content poison/quarantine.
+          const accept =
+            !this.turnCancelled &&
+            this.activePromptRpcId != null &&
+            this.streamAcceptGeneration > 0 &&
+            this.streamAcceptGeneration === this.activePromptGeneration &&
+            this.promptWireAtMs > 0 &&
+            Date.now() >= this.promptWireAtMs;
+          if (!accept) {
+            continue;
+          }
+          // Drop residual tool lifecycle even after gate open
+          if (ev.type === "tool.started" || ev.type === "tool.completed") {
+            const tid = String(
+              (ev as { toolCallId?: string }).toolCallId ?? "",
+            ).trim();
+            if (tid && this.residualToolCallIds.has(tid)) {
+              if (ev.type === "tool.completed") this.residualToolCallIds.delete(tid);
+              continue;
+            }
+          }
+        }
         if (ev.type === "message.delta" && ev.role === "assistant") {
           this.streamedAssistantThisTurn = true;
         }

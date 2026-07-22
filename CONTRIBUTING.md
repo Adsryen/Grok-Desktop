@@ -54,6 +54,17 @@ npm run dev
 | `agent-bin/` | 本地二进制 + VERSION.txt，**不入库** |
 | `~/.grok-desktop` | 运行时用户数据（测试勿提交） |
 
+## 功能实现：CLI 优先（强制）
+
+**任何功能与行为修复，实现前必须先看 Grok CLI，再定桌面方案，最后写代码。**
+
+1. 调研 CLI：`tmp/grok-build-main`（pager / shell / ACP）。  
+2. 归纳语义与 wire（用户心智 + 协议真源）。  
+3. 设计 **适合 Desktop** 的方案（对齐契约与结果；不硬抄 Leader/TUI 内部）。  
+4. 再实现；用 Host 日志 / 契约验证，禁止只堆 UI 启发式。  
+
+完整约定见仓库根目录 **[AGENTS.md](./AGENTS.md)**；能力对照见 [docs/cli-desktop-capability-matrix.md](./docs/cli-desktop-capability-matrix.md)。
+
 ## 贡献范围建议
 
 优先：

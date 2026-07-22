@@ -163,6 +163,11 @@ export type HostIpcMethod =
   | "shell.parseDeepLink"
   | "shell.versionMatrix"
   | "shell.readHandoff"
+  // app update (manual check → download → install)
+  | "app.update.status"
+  | "app.update.check"
+  | "app.update.download"
+  | "app.update.install"
   // S7 PR / remote
   | "pr.list"
   | "pr.diff"

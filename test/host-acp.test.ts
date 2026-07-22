@@ -118,6 +118,50 @@ describe("DesktopHost + ACP (shipped path)", () => {
     expect(ping.alive).toBe(true);
   });
 
+  it("session/cancel carries CLI-aligned _meta (trigger + cancelPromptId)", async () => {
+    const cancelLog = path.join(
+      os.tmpdir(),
+      `fake-acp-cancel-${Date.now()}.json`,
+    );
+    const host = makeHost({
+      FAKE_ACP_CANCEL_LOG: cancelLog,
+      FAKE_ACP_SLOW_PROMPT: "1",
+    });
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "grok-desktop-cancel-"));
+    // Create session without initial prompt (slow prompt would hang create)
+    const created = await host.threadsCreate({ cwd, title: "cancel-meta" });
+
+    const promptP = host.turnsPrompt(created.threadId, "hang please");
+    // Let prompt hit the wire
+    await new Promise((r) => setTimeout(r, 80));
+    await host.turnsCancel(created.threadId, { trigger: "esc" });
+    await promptP.catch(() => undefined);
+
+    // Concurrent cancel after settle: must not throw
+    await Promise.all([
+      host.turnsCancel(created.threadId, { trigger: "stop" }),
+      host.turnsCancel(created.threadId, { trigger: "stop" }),
+    ]);
+
+    expect(fs.existsSync(cancelLog)).toBe(true);
+    const raw = JSON.parse(fs.readFileSync(cancelLog, "utf8")) as Array<{
+      sessionId?: string;
+      _meta?: {
+        cancelSubagents?: boolean;
+        cancelTrigger?: string;
+        rewindIfPristine?: boolean;
+        cancelPromptId?: string;
+      };
+    }>;
+    expect(raw.length).toBeGreaterThanOrEqual(1);
+    const first = raw[0]!;
+    expect(first.sessionId).toBe(created.sessionId);
+    expect(first._meta?.cancelSubagents).toBe(true);
+    expect(first._meta?.cancelTrigger).toBe("esc");
+    expect(first._meta?.rewindIfPristine).toBe(false);
+    expect(String(first._meta?.cancelPromptId ?? "")).toMatch(/^p_/);
+  });
+
   it("returns structured HostError for missing binary", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-desktop-nobin-"));
     const host = new DesktopHost({

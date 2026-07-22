@@ -8,6 +8,32 @@ import type { HostIpcMethod } from "../shared/host-api.js";
 import type { NormalizedEvent } from "../shared/events.js";
 import { matchFriendlyErrorTitleKey } from "../shared/friendly-error-title.js";
 import {
+  armClearsHistoryResyncBlock,
+  assistantsAfterLastUser,
+  historyLastUserMatchesTimeline,
+  isCleanAssistantStreamForResyncUnlock,
+  shouldSkipHistoryResync,
+} from "../shared/history-resync-policy.js";
+import {
+  resolveBusySendWhileCancelling,
+  shouldIgnoreCancelledTurnCompleted,
+  shouldIgnoreLateSessionWorking,
+  shouldIgnoreLateTurnStarted,
+  shouldJoinInFlightCancel,
+  shouldPaintStoppedPhase,
+  type TurnUiPhase,
+} from "../shared/turn-ui-state.js";
+import {
+  appendBackgroundAssistantDelta,
+  getSessionTurn,
+  idleProjection,
+  markSessionTurnIdle,
+  patchSessionTurn,
+  setSessionTurn,
+  shouldRehydrateBusy,
+  type SessionTurnProjection,
+} from "./session-turn-store.js";
+import {
   applyDomI18n,
   onLocaleChange,
   resolveLocale,
@@ -144,10 +170,30 @@ function threadsForProject(projectId: string): ThreadRow[] {
     .filter((t) => {
       if (t.projectId === projectId) return true;
       if (!proj) return false;
+      // 无 projectId 的「不使用项目」会话不归入项目（即使 cwd 碰巧在项目下）
+      if (!t.projectId) return false;
       const cwd = t.cwd.replace(/\\/g, "/").toLowerCase();
       const root = proj.path.replace(/\\/g, "/").toLowerCase();
       return cwd === root || cwd.startsWith(root + "/");
     })
+    .sort((a, b) =>
+      (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
+    );
+}
+
+/** 侧栏虚拟组：不使用项目的会话 */
+const CHATS_GROUP_ID = "__chats__";
+
+/** 未挂任何项目的会话（侧栏「对话」组） */
+function threadsForChatsGroup(): ThreadRow[] {
+  const claimed = new Set<string>();
+  for (const p of projects) {
+    for (const t of threadsForProject(p.id)) {
+      claimed.add(t.sessionId);
+    }
+  }
+  return threads
+    .filter((t) => !claimed.has(t.sessionId))
     .sort((a, b) =>
       (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""),
     );
@@ -213,8 +259,49 @@ let pendingPlanApproval: {
 /**
  * turns.prompt IPC 返回与 turn.completed / 末包 message.delta 可能乱序；
  * endTurn 后短窗口内仍接受本 turn 的 assistant 流，避免「会话断了、最后一泡没了」。
+ * 用户主动停止时清零，避免 cancel 后仍复活工具/流。
  */
 let lateStreamUntil = 0;
+/**
+ * 用户点停止后，忽略会「复活」turn 的迟到事件（tool.started / turn.started 等），
+ * 直到 Host 对本轮发出 turn.started（闸门已开）再 arm。
+ * 窗口宜短：隔离靠 Host generation gate，不靠长 suppress / 内容毒化。
+ */
+let userStopSuppressUntil = 0;
+/**
+ * 用户停止后：本轮必须等 armTurnForLiveStream 才收流。
+ * 防止 beginTurn 后、Host 闸门打开前误收 T1 残留。
+ */
+let streamArmedThisTurn = true;
+/**
+ * 用户停止后：禁止 history 回补（agent 可能把 T1 续写落盘到 T2 下）。
+ * **仅**本轮出现干净助手流后解除（arm 不解除，见 history-resync-policy）。
+ * 禁止词级毒化。
+ */
+let blockHistoryResyncAfterStop = false;
+/** cancelTurn 进行中：二次停止 join 同一 in-flight（Phase4 Cancelling） */
+let cancelTurnInFlight: Promise<void> | null = null;
+/**
+ * Turn UI 相位（Phase4）：idle | working | cancelling。
+ * cancelling 可与 turnActive=false 并存（乐观 stop 后 host 仍在 cancel）。
+ */
+let turnUiPhase: TurnUiPhase = "idle";
+/** 本 stop 是否已乐观画过「已停止」（防双条） */
+let alreadyPaintedStopped = false;
+/**
+ * 回合进行中再次发送：queue（默认入队）| send_now（打断并发送）。
+ * 来自 settings `busySendMode`。
+ */
+type BusySendMode = "queue" | "send_now";
+let busySendMode: BusySendMode = "queue";
+/**
+ * 用户 Stop/Esc 取消后，下一条真正发给 agent 的 prompt 前做
+ * conversation_only rewind（摘掉被取消 user 轮）。send_now 不设。
+ * 不在 Desktop 拼 focus system-reminder（对齐 CLI agent 侧独立 reminder）。
+ */
+let pendingPostCancelFocus = false;
+/** 被取消轮的 prompt_index（UI data-prompt-index；conversation_only rewind 用） */
+let lastCancelledPromptIndex: number | null = null;
 /**
  * 同一 turn 内错误只展示一次：turn.completed(error) 与 turns.prompt IPC 失败
  * 会先后带同一条 Internal error（#6 起双路径都画红条）。
@@ -642,7 +729,9 @@ function ensureTurnPhaseWorking(): void {
 
 /**
  * Codex：Worked for / You stopped after — 固定留在时间线。
- * 插在过程块后，否则 transcript 末尾。
+ * 必须钉在 transcript **末尾**（过程块 + 助手气泡之后）。
+ * 旧逻辑插在 processBlock 后会把「已停止」挤到助手正文前面，
+ * 看起来像「停了还在出毛玻璃长文」。
  */
 function paintTurnPhaseDone(
   kind: "worked" | "stopped",
@@ -653,39 +742,31 @@ function paintTurnPhaseDone(
     kind === "stopped"
       ? formatTurnStopped(elapsedMs)
       : formatTurnElapsed(elapsedMs);
+  const root = $("transcript");
   // 复用进行中的 phase 节点，改成完成态（避免两条分隔）
   if (turnPhaseEl?.isConnected) {
     turnPhaseEl.classList.remove("is-working");
     turnPhaseEl.classList.add(kind === "stopped" ? "is-stopped" : "is-done");
     turnPhaseEl.innerHTML = `<span class="turn-phase-label">${esc(label)}</span>`;
     turnPhaseEl.setAttribute("aria-label", label);
-    // 挪到过程块之后（若过程块在它后面插入过）
-    if (processBlockEl?.isConnected) {
-      const next = processBlockEl.nextElementSibling;
-      if (next !== turnPhaseEl) {
-        processBlockEl.insertAdjacentElement("afterend", turnPhaseEl);
-      }
+    // 钉回末尾：助手气泡可能在 Working 条之后又追加了
+    if (root.lastElementChild !== turnPhaseEl) {
+      root.appendChild(turnPhaseEl);
     }
     scrollTranscript();
     return;
   }
 
   // 清掉旧 footer 类名节点（兼容）
-  if (processBlockEl?.isConnected) {
-    const prev = processBlockEl.nextElementSibling;
-    if (prev?.classList.contains("turn-elapsed")) prev.remove();
-  }
+  const stale = root.querySelector(".line.turn-elapsed");
+  if (stale) stale.remove();
 
   const foot = document.createElement("div");
   foot.className = `line turn-phase ${kind === "stopped" ? "is-stopped" : "is-done"}`;
   foot.setAttribute("role", "status");
   foot.setAttribute("aria-label", label);
   foot.innerHTML = `<span class="turn-phase-label">${esc(label)}</span>`;
-  if (processBlockEl?.isConnected) {
-    processBlockEl.insertAdjacentElement("afterend", foot);
-  } else {
-    $("transcript").appendChild(foot);
-  }
+  root.appendChild(foot);
   turnPhaseEl = foot;
   scrollTranscript();
 }
@@ -1954,10 +2035,134 @@ function showPromptHistorySearch(): { ok: boolean; message?: string } {
   return { ok: true };
 }
 
+/**
+ * 方案 B：把当前主区 turn 投影快照到 session 槽（切走前调用）。
+ * 对齐 CLI：每个 agent 自带 TurnRunning，切换不清 Host turn。
+ */
+function snapshotActiveSessionTurn(sessionId: string | null | undefined): void {
+  const sid = sessionId?.trim();
+  if (!sid) return;
+  const prev = getSessionTurn(sid);
+  setSessionTurn(sid, {
+    turnActive,
+    turnUiPhase,
+    alreadyPaintedStopped,
+    turnStartedAt,
+    assistantStartedThisTurn,
+    streamArmedThisTurn,
+    blockHistoryResyncAfterStop,
+    userStopSuppressUntil,
+    lateStreamUntil,
+    currentTurnId,
+    pendingAssistantText: prev?.pendingAssistantText ?? "",
+    updatedAtMs: Date.now(),
+  });
+}
+
+/** 将 store 投影应用到主区全局变量（不含 DOM 补画） */
+function applySessionTurnProjection(p: SessionTurnProjection): void {
+  turnActive = p.turnActive;
+  turnUiPhase = p.turnUiPhase;
+  alreadyPaintedStopped = p.alreadyPaintedStopped;
+  turnStartedAt = p.turnStartedAt > 0 ? p.turnStartedAt : p.turnActive ? Date.now() : 0;
+  assistantStartedThisTurn = p.assistantStartedThisTurn;
+  streamArmedThisTurn = p.streamArmedThisTurn;
+  blockHistoryResyncAfterStop = p.blockHistoryResyncAfterStop;
+  userStopSuppressUntil = p.userStopSuppressUntil;
+  lateStreamUntil = p.lateStreamUntil;
+  if (p.currentTurnId > currentTurnId) currentTurnId = p.currentTurnId;
+  streamTurnId = p.turnActive && p.streamArmedThisTurn ? currentTurnId : 0;
+}
+
+/**
+ * 切回会话：按 Host promptInFlight / 投影 / 侧栏 恢复 busy 主区。
+ * promptInFlight===false 时强制 idle（后台已完成不可再显示工作中）。
+ */
+function rehydrateSessionTurnProjection(
+  sessionId: string,
+  opts?: {
+    threadStatus?: string;
+    promptInFlight?: boolean;
+  },
+): void {
+  const proj = getSessionTurn(sessionId);
+  const busy = shouldRehydrateBusy({
+    projection: proj,
+    sidebarWorking: workingSessions.has(sessionId),
+    threadStatus: opts?.threadStatus,
+    promptInFlight: opts?.promptInFlight,
+  });
+  if (!busy) {
+    // 与 Host 对齐：清过期 busy 投影
+    markSessionTurnIdle(sessionId);
+    markSessionWorking(sessionId, false);
+    turnActive = false;
+    turnUiPhase = "idle";
+    turnStartedAt = 0;
+    streamArmedThisTurn = false;
+    streamTurnId = 0;
+    setComposerBusy(false);
+    removeTurnStatus();
+    stopTurnPhaseTimer();
+    if (turnPhaseEl?.isConnected && turnPhaseEl.classList.contains("is-working")) {
+      // 历史已画完回复时，去掉卡住的「工作中」条
+      turnPhaseEl.remove();
+      turnPhaseEl = null;
+    }
+    return;
+  }
+  const base = proj ?? {
+    ...idleProjection(),
+    turnActive: true,
+    turnUiPhase: "working" as TurnUiPhase,
+    turnStartedAt: Date.now(),
+    streamArmedThisTurn: true,
+  };
+  applySessionTurnProjection({
+    ...base,
+    turnActive: true,
+    turnUiPhase:
+      base.turnUiPhase === "cancelling" ? "cancelling" : "working",
+    streamArmedThisTurn: true,
+  });
+  if (currentTurnId <= 0) currentTurnId = 1;
+  streamTurnId = currentTurnId;
+  setComposerBusy(true);
+  if (activeSessionId) markSessionWorking(activeSessionId, true);
+  ensureTurnStatus(tr("turn.thinking"));
+  ensureTurnPhaseWorking();
+  // 切走期间积压的助手增量（history 可能尚未落盘）
+  const pending = (proj?.pendingAssistantText || "").trim();
+  if (pending) {
+    appendLine(pending, "assistant", { fromStream: true });
+    patchSessionTurn(sessionId, { pendingAssistantText: "" });
+  }
+}
+
+/** 当前会话 turn 变化时写回 store，保持与 CLI AgentView.state 同步 */
+function syncActiveSessionTurnToStore(): void {
+  if (!activeSessionId) return;
+  snapshotActiveSessionTurn(activeSessionId);
+}
+
 function markSessionWorking(sessionId: string | null, working: boolean): void {
   if (!sessionId) return;
   if (working) workingSessions.add(sessionId);
   else workingSessions.delete(sessionId);
+  // 侧栏 ↔ 投影：idle 必须清 turnActive（修后台完成后仍 rehydrate busy）
+  if (!working) {
+    markSessionTurnIdle(sessionId);
+  } else if (sessionId !== activeSessionId) {
+    const p = getSessionTurn(sessionId);
+    if (!p?.turnActive) {
+      patchSessionTurn(sessionId, {
+        turnActive: true,
+        turnUiPhase: "working",
+        turnStartedAt: p?.turnStartedAt || Date.now(),
+        streamArmedThisTurn: true,
+      });
+    }
+  }
   // 轻量刷新侧栏 working 样式（不全量 rebuild 时只改 class）
   const list = $("project-list");
   Array.from(list.querySelectorAll<HTMLElement>(".thread-item")).forEach(
@@ -2051,18 +2256,60 @@ function setTurnStatus(label: string): void {
   }
 }
 
+/**
+ * 流式拼接时：prev 已是一段像完整回复的文字，chunk 又像另一段回复开头
+ * → 禁止 `prev + chunk`（跨 turn 串流典型形态，如图：苹果回复 + 螺蛳粉回复）。
+ */
+function looksLikeGluedNewAssistantReply(prev: string, chunk: string): boolean {
+  const p = prev.trim();
+  const c = chunk.trim();
+  if (!p || !c) return false;
+  if (c.startsWith(p) || p.startsWith(c)) return false;
+  // 正常 token 续写：短增量
+  if (c.length <= 32) return false;
+  // 大块新全文（非 prev 前缀）：几乎一定是另一轮的完整/半完整回复
+  if (c.length >= 24 && p.length >= 30 && !c.startsWith(p.slice(0, 20))) {
+    const restarts =
+      /^(你好|您好|嗨|哈喽|Hi\b|Hello\b|我是|针对|关于|好的|收到|发了[「""])/i.test(
+        c,
+      );
+    const prevLooksFinished =
+      p.length >= 50 ||
+      /[。！？.!?]\s*$/.test(p) ||
+      /\n\s*[-*•]/.test(p) ||
+      /例如[：:]/.test(p);
+    if (restarts && prevLooksFinished) return true;
+    // 两段都像「独立段落开头」且无共享前缀
+    if (prevLooksFinished && c.length >= 40) return true;
+  }
+  return false;
+}
+
 function beginTurn(): void {
   // 先定稿并切断上一 turn 的流式指针，防止新 delta 拼进旧气泡
   resetStreamState(true);
   clearTurnStatusDoneTimer();
   stopTurnPhaseTimer();
+  // 若上一轮刚用户停止：保持 suppress，streamTurnId=0，streamArmed=false，
+  // 直到 Host 发出本轮 turn.started（闸门已开：prompt 在线 + 残留静默）再 arm。
+  // 注意：turns.prompt IPC 要等整轮结束才返回，绝不能在 inv 成功后再 arm。
+  const holdSuppress = isUserStopSuppressed();
   // 新回合开始：上一轮 phase 留在时间线，本轮新建
   turnPhaseEl = null;
   turnActive = true;
+  turnUiPhase = "working";
+  alreadyPaintedStopped = false;
   lateStreamUntil = 0;
   turnStartedAt = Date.now();
   currentTurnId += 1;
-  streamTurnId = currentTurnId;
+  if (holdSuppress) {
+    streamTurnId = 0;
+    streamArmedThisTurn = false;
+  } else {
+    userStopSuppressUntil = 0;
+    streamTurnId = currentTurnId;
+    streamArmedThisTurn = true;
+  }
   assistantStartedThisTurn = false;
   lastShownTurnError = null;
   thoughtBlockEl = null;
@@ -2075,6 +2322,61 @@ function beginTurn(): void {
   ensureTurnPhaseWorking();
   setComposerBusy(true);
   if (activeSessionId) markSessionWorking(activeSessionId, true);
+  syncActiveSessionTurnToStore();
+}
+
+/**
+ * Host 已打开本轮流闸门（turn.started）后调用。
+ * 解除停止抑制并接受流式。turns.prompt IPC 返回太晚，不能依赖它。
+ * 注意：arm **不**解除 blockHistoryResyncAfterStop（Phase3：防 T2 空完成贴 T1 落盘）。
+ */
+function armTurnForLiveStream(): void {
+  userStopSuppressUntil = 0;
+  streamTurnId = currentTurnId;
+  streamArmedThisTurn = true;
+  lateStreamUntil = 0;
+  if (armClearsHistoryResyncBlock()) {
+    blockHistoryResyncAfterStop = false;
+  }
+  syncActiveSessionTurnToStore();
+}
+
+/** 本 turn 出现过干净助手流 → 允许后续 history 回补 */
+function noteCleanAssistantStream(text: string): void {
+  if (!blockHistoryResyncAfterStop) return;
+  if (!isCleanAssistantStreamForResyncUnlock(text)) return;
+  blockHistoryResyncAfterStop = false;
+}
+
+/** 时间线最后一条用户可见正文（供 history 回补对齐） */
+function timelineLastUserText(): string {
+  const blocks = $("transcript").querySelectorAll(".user-msg-block");
+  if (blocks.length) {
+    const last = blocks[blocks.length - 1] as HTMLElement;
+    const raw = last.dataset.rawText ?? "";
+    if (raw.trim()) return raw.replace(/\s+/g, " ").trim().slice(0, 120);
+    const textEl =
+      last.querySelector(".user-msg-text") ||
+      last.querySelector(".msg-user-text") ||
+      last.querySelector(".msg-text");
+    return (textEl?.textContent ?? last.textContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+  const lines = $("transcript").querySelectorAll(".line.user");
+  if (lines.length) {
+    return (lines[lines.length - 1].textContent ?? "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 120);
+  }
+  return "";
+}
+
+/** 用户刚点停止：丢弃会复活 turn 的迟到直播事件 */
+function isUserStopSuppressed(): boolean {
+  return userStopSuppressUntil > 0 && Date.now() < userStopSuppressUntil;
 }
 
 function endTurn(opts?: {
@@ -2082,14 +2384,51 @@ function endTurn(opts?: {
   skipQueueDrain?: boolean;
   /** 对齐 Codex：正常完成 Worked for / 用户停止 You stopped after */
   outcome?: "worked" | "stopped";
+  /**
+   * 方案 B：切会话清主区时勿把「仍在后台跑」的投影写成 idle。
+   * 调用方须已 snapshotActiveSessionTurn；且勿 markSessionWorking(false)。
+   */
+  skipSessionStoreSync?: boolean;
 }): void {
   // 无活跃回合时只做清理，不画「已完成 · 0ms」（openThread/rewind 会误触）
   const hadTurn = turnActive || turnStartedAt > 0;
-  // 先放行迟到流，再关 busy；不立刻丢弃末包
-  if (hadTurn) lateStreamUntil = Date.now() + 4000;
-  const elapsed = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
   const outcome = opts?.outcome ?? "worked";
+  const preserveBgWorking = opts?.skipSessionStoreSync === true;
+
+  // Phase4：乐观 stop 后迟到 endTurn(stopped) — 只清 busy，不二次 paint
+  if (
+    outcome === "stopped" &&
+    !shouldPaintStoppedPhase({ alreadyPaintedStopped })
+  ) {
+    turnActive = false;
+    if (turnUiPhase !== "cancelling") turnUiPhase = "idle";
+    lateStreamUntil = 0;
+    setComposerBusy(false);
+    if (activeSessionId && !preserveBgWorking) {
+      markSessionWorking(activeSessionId, false);
+    }
+    removeTurnStatus();
+    if (!opts?.skipSessionStoreSync) syncActiveSessionTurnToStore();
+    if (!opts?.skipQueueDrain) scheduleDrainPromptQueue();
+    return;
+  }
+
+  // 正常完成：短窗口接受本 turn 末包；用户停止：禁止任何迟到流/回补
+  if (hadTurn && outcome !== "stopped") {
+    lateStreamUntil = Date.now() + 4000;
+  } else if (outcome === "stopped") {
+    lateStreamUntil = 0;
+  }
+  const elapsed = turnStartedAt > 0 ? Date.now() - turnStartedAt : 0;
   turnActive = false;
+  if (outcome === "stopped") {
+    alreadyPaintedStopped = true;
+    // cancelling 保持到 cancelTurn finally；否则 idle
+    if (turnUiPhase !== "cancelling") turnUiPhase = "idle";
+  } else {
+    turnUiPhase = "idle";
+    alreadyPaintedStopped = false;
+  }
   stopTurnPhaseTimer();
 
   endProcessTextStream();
@@ -2109,13 +2448,13 @@ function endTurn(opts?: {
   if (hadTurn) {
     // Codex：Worked for / You stopped after — 有无过程块都固定留下
     paintTurnPhaseDone(outcome === "stopped" ? "stopped" : "worked", elapsed);
-    // 状态条：先显示完成态再淡出（不立刻消失）
-    promoteTurnStatusToDone(
-      outcome === "stopped"
-        ? formatTurnStopped(elapsed)
-        : formatTurnElapsed(elapsed),
-      outcome === "stopped" ? "stopped" : "done",
-    );
+    if (outcome === "stopped") {
+      // 停止只保留 turn-phase 一条「已停止」，勿再 promote 状态条（会双条）
+      removeTurnStatus();
+    } else {
+      // 正常完成：状态条短暂显示完成态再淡出
+      promoteTurnStatusToDone(formatTurnElapsed(elapsed), "done");
+    }
   } else {
     removeTurnStatus();
   }
@@ -2136,7 +2475,10 @@ function endTurn(opts?: {
     if (st) st.textContent = tr("tool.completed");
   });
   setComposerBusy(false);
-  if (activeSessionId) markSessionWorking(activeSessionId, false);
+  // 切会话：保留侧栏 working + store 快照，勿 mark false
+  if (activeSessionId && !preserveBgWorking) {
+    markSessionWorking(activeSessionId, false);
+  }
   // 定稿当前助手 Markdown，但保留 stream 指针，供 grace 内迟到 delta 续写
   if (
     streamRole === "assistant" &&
@@ -2148,6 +2490,8 @@ function endTurn(opts?: {
   } else {
     endStreamBubble();
   }
+  // 方案 B：同步投影（切会话时 skip，避免覆盖切前 snapshot）
+  if (!opts?.skipSessionStoreSync) syncActiveSessionTurnToStore();
   // S19：turn 结束后发送队首 follow-up（force 续发时跳过，避免与新 prompt 竞态）
   if (!opts?.skipQueueDrain) scheduleDrainPromptQueue();
 }
@@ -2178,39 +2522,111 @@ function paintHistoryReplayDone(entryCount: number): void {
   scrollTranscript();
 }
 
-async function cancelTurn(opts?: { clearQueue?: boolean }): Promise<void> {
-  if (!turnActive) return;
-  const tid =
-    activeThreadId && !activeThreadId.startsWith("disk_")
-      ? activeThreadId
-      : null;
-  const shouldPauseGoal = Boolean(currentGoalTitle() && !goalPaused && !goalCompleted);
-  // 用户点停止：默认保留队列并暂停自动 drain（对齐 Codex interrupt）；显式 clearQueue 时清空
-  if (opts?.clearQueue) {
-    clearPromptQueue({ silent: true });
-  } else if (promptQueue.length) {
-    queuePausedByInterrupt = true;
-    syncPromptQueueBar();
-    if (activeSessionId) {
-      void hostSetQueueFlags(inv, activeSessionId, {
-        pausedByInterrupt: true,
+/**
+ * 用户停止当前 turn。
+ * - interrupt 语义：默认保留队列并 pause 自动 drain（对齐 CLI/Codex）
+ * - send_now：不 pause 队列（用户在继续工作）
+ * - 立即结算 UI；Host session/cancel 带 _meta
+ * - 并发 stop 加入同一 cancelInFlight
+ * - trigger：stop | esc | send_now
+ */
+async function cancelTurn(opts?: {
+  clearQueue?: boolean;
+  /** CLI cancelTrigger：stop | esc | send_now */
+  trigger?: string;
+  /**
+   * 是否 pause 自动 drain。
+   * 默认 true（Stop/Esc）；send_now 传 false。
+   */
+  pauseQueue?: boolean;
+}): Promise<void> {
+  // Phase4：Cancelling 中二次 stop → join，不新开、不双条
+  if (
+    shouldJoinInFlightCancel({ cancelInFlight: Boolean(cancelTurnInFlight) })
+  ) {
+    await cancelTurnInFlight;
+    if (!turnActive) return;
+  }
+  if (!turnActive && !cancelTurnInFlight) return;
+
+  const trigger = opts?.trigger?.trim() || "stop";
+  const pauseQueue = opts?.pauseQueue !== false;
+  turnUiPhase = "cancelling";
+  cancelTurnInFlight = (async () => {
+    const tid =
+      activeThreadId && !activeThreadId.startsWith("disk_")
+        ? activeThreadId
+        : null;
+    const shouldPauseGoal = Boolean(
+      currentGoalTitle() && !goalPaused && !goalCompleted,
+    );
+    // interrupt：保留队列 + 暂停 drain；send_now / clearQueue 另议
+    if (opts?.clearQueue) {
+      clearPromptQueue({ silent: true });
+    } else if (pauseQueue && promptQueue.length) {
+      queuePausedByInterrupt = true;
+      syncPromptQueueBar();
+      if (activeSessionId) {
+        void hostSetQueueFlags(inv, activeSessionId, {
+          pausedByInterrupt: true,
+        });
+      }
+    } else if (!pauseQueue) {
+      // send_now：用户继续工作，解除 interrupt pause
+      if (queuePausedByInterrupt) {
+        queuePausedByInterrupt = false;
+        syncPromptQueueBar();
+        if (activeSessionId) {
+          void hostSetQueueFlags(inv, activeSessionId, {
+            pausedByInterrupt: false,
+          });
+        }
+      }
+    }
+    // 停止后短暂禁止 history 回补（下一轮干净流后解除）
+    blockHistoryResyncAfterStop = true;
+    // 下一用户题：conversation_only rewind 摘掉本取消轮（send_now 除外）
+    // 不在 Desktop 注入 focus system-reminder（对齐 CLI：agent 侧独立 reminder）
+    if (trigger !== "send_now") {
+      pendingPostCancelFocus = true;
+      const lastUser = $("transcript").querySelector(
+        ".user-msg-block:last-of-type",
+      ) as HTMLElement | null;
+      const idx = Number(lastUser?.dataset.promptIndex);
+      lastCancelledPromptIndex = Number.isFinite(idx) && idx >= 0 ? idx : null;
+    }
+    // 先锁 UI：关闭 late grace；短 suppress，等本轮 turn.started 再 arm
+    lateStreamUntil = 0;
+    userStopSuppressUntil = Date.now() + 8_000;
+    streamTurnId = 0;
+    streamArmedThisTurn = false;
+    // 立即结算 UI（不必等 session/cancel 往返）；endTurn 幂等防双条
+    // interrupt 暂停时 skipQueueDrain：队列保留，用户 resume 后再发
+    // send_now 也 skip：本路径紧接着会发新 prompt，勿 drain 队首抢发
+    if (turnActive || !alreadyPaintedStopped) {
+      endTurn({
+        outcome: "stopped",
+        skipQueueDrain:
+          !pauseQueue ||
+          queuePausedByInterrupt ||
+          Boolean(opts?.clearQueue),
       });
     }
-  }
-  if (tid) {
-    const res = await inv("turns.cancel", { threadId: tid });
-    if (!res.ok) {
-      endTurn({ outcome: "stopped" });
-      appendLine(res.error?.message ?? tr("turn.stopFailed"), "error");
-      return;
+    if (tid) {
+      const res = await inv("turns.cancel", { threadId: tid, trigger });
+      if (!res.ok) {
+        appendLine(res.error?.message ?? tr("turn.stopFailed"), "error");
+      }
     }
-  }
-  // endTurn → scheduleDrain；queuePausedByInterrupt 时 schedule 为空操作
-  endTurn({ outcome: "stopped" });
-  // 停止后再同源暂停 goal（避免与 cancel 抢 prompt）
-  if (shouldPauseGoal) {
-    await pauseGoal({ fromStop: true });
-  }
+    // send_now：不因 Stop 暂停 goal；普通 stop 仍 pause
+    if (shouldPauseGoal && pauseQueue) {
+      await pauseGoal({ fromStop: true });
+    }
+  })().finally(() => {
+    cancelTurnInFlight = null;
+    if (turnUiPhase === "cancelling") turnUiPhase = "idle";
+  });
+  await cancelTurnInFlight;
 }
 
 function appendThoughtDelta(text: string): void {
@@ -2343,11 +2759,17 @@ function appendLine(
   }
 
   if (cls === "assistant" && fromStream) {
+    // 用户停止后一律丢弃流式（含跨 turn 的 T1 迟到包）
+    if (isUserStopSuppressed()) return;
+    // 停止后本轮尚未 arm：禁止写入（Host 闸门未开前的残留）
+    if (!streamArmedThisTurn || !streamTurnId) return;
     // 活跃 turn，或 endTurn 后 grace 内的本 turn 迟到末包
     const inLateGrace =
       !turnActive &&
+      lateStreamUntil > 0 &&
       Date.now() <= lateStreamUntil &&
       streamTurnId === currentTurnId &&
+      streamArmedThisTurn &&
       currentTurnId > 0;
     if (
       (!turnActive && !inLateGrace) ||
@@ -2356,13 +2778,7 @@ function appendLine(
     ) {
       return;
     }
-    // 首段助手输出：移除 Thinking 占位
-    if (!assistantStartedThisTurn) {
-      assistantStartedThisTurn = true;
-      removeTurnStatus();
-    }
-
-    // 累积 raw
+    // 累计流式文本；若检测到「新答复粘在旧尾巴上」则拆开旧气泡（generation 隔离为主）
     let nextRaw = streamAssistantRaw;
     if (
       streamBubble &&
@@ -2377,11 +2793,29 @@ function appendLine(
         text.length < streamAssistantRaw.length
       ) {
         return;
+      } else if (looksLikeGluedNewAssistantReply(streamAssistantRaw, text)) {
+        // 截断旧气泡（多为被取消轮次的迟到全文），只用新段开新流
+        if (streamAssistantRaw.length > 40) {
+          streamBubble.remove();
+        } else {
+          flushAssistantMarkdown(streamBubble);
+          streamBubble.classList.remove("streaming");
+        }
+        streamBubble = null;
+        streamAssistantRaw = "";
+        nextRaw = text;
       } else {
         nextRaw = streamAssistantRaw + text;
       }
     } else {
-      nextRaw = text;
+      nextRaw = streamAssistantRaw ? streamAssistantRaw + text : text;
+    }
+
+    noteCleanAssistantStream(nextRaw);
+    // 首段助手输出：移除 Thinking 占位
+    if (!assistantStartedThisTurn) {
+      assistantStartedThisTurn = true;
+      removeTurnStatus();
     }
 
     const asProcess = looksLikeGoalProcessText(nextRaw) || streamIsProcess;
@@ -2470,6 +2904,14 @@ function appendLine(
 
   // 完整 assistant（history 回放 / 非流式）— 只渲染一次，且不进入流式指针
   if (cls === "assistant" && !fromStream) {
+    // 停止后禁止 history 回补把 T1 贴到时间线末尾（「已停止」下方再出长文）
+    if (
+      isUserStopSuppressed() ||
+      blockHistoryResyncAfterStop ||
+      turnUiPhase === "cancelling"
+    ) {
+      return;
+    }
     if (looksLikeGoalProcessText(text)) {
       resetStreamState(true);
       const { body } = ensureProcessBlock();
@@ -3323,8 +3765,9 @@ async function startFreshSessionWithModel(
   effort: EffortLevel,
 ): Promise<{ ok: boolean; message?: string }> {
   const p = selectedProject();
+  const noProject = !p && !selectedProjectId;
   const cwd = activeCwd || p?.path;
-  if (!cwd) {
+  if (!cwd && !noProject) {
     return { ok: false, message: tr("model.needProject") };
   }
   // 先干净离开旧 live（保持项目 cwd 选中），再 create 空会话
@@ -3333,7 +3776,11 @@ async function startFreshSessionWithModel(
   // 保留旧会话 L1 队列；新会话空队列
   await leaveCurrentSessionToWelcome({ clearQueue: false });
   if (keepProjectId) selectedProjectId = keepProjectId;
-  setActiveCwd(keepCwd);
+  else {
+    selectedProjectId = null;
+    projectChoiceTouched = true;
+  }
+  if (keepCwd) setActiveCwd(keepCwd);
   clearPromptHistoryStore();
 
   setModelId(modelId);
@@ -3349,6 +3796,7 @@ async function startFreshSessionWithModel(
   }>("threads.create", {
     cwd: keepCwd,
     projectId: keepProjectId ?? p?.id,
+    noProject: noProject || undefined,
     title: `新会话 · ${shortModelName(modelId)}`.slice(0, 48),
     model: modelId,
     effort,
@@ -3376,6 +3824,11 @@ async function startFreshSessionWithModel(
   setActiveCwd(res.data!.cwd);
   sidePane?.onSessionChanged();
   if (p?.id) selectedProjectId = p.id;
+  else {
+    selectedProjectId = null;
+    projectChoiceTouched = true;
+    expandedProjectIds.add(CHATS_GROUP_ID);
+  }
   suspendLiveTranscript = false;
   clearTranscript();
   showWelcome(false);
@@ -4435,6 +4888,16 @@ function scheduleTurnSettle(turnId: number): void {
       // Still running - leave UI as-is; turn.completed / error path will settle.
       return;
     }
+    // Stop / block 窗口内禁止 history 贴迟到落盘
+    if (
+      shouldSkipHistoryResync({
+        assistantStartedThisTurn,
+        userStopSuppressed: isUserStopSuppressed(),
+        blockAfterStop: blockHistoryResyncAfterStop,
+      })
+    ) {
+      return;
+    }
     void afterTurnSettled();
   }, 1500);
 }
@@ -4451,11 +4914,20 @@ async function afterTurnSettled(): Promise<void> {
 async function resyncMissingAssistantFromHistory(): Promise<void> {
   if (!activeSessionId) return;
   /**
-   * 新对话直播路径：本 turn 已流式画出助手回复时，禁止再从 history 回补。
-   * 磁盘落盘文案常与流式略有出入（如「现在想做什么」vs「你现在想做什么」），
-   * 旧去重会漏判 → 「已完成」下方再贴一整条重复气泡。
+   * Phase3 契约（history-resync-policy）：
+   * - 已流式助手 → 不 resync（防重复）
+   * - stop suppress / blockAfterStop → 不 resync（防 T1 落盘贴 T2）
+   * - 只取 last user 之后的 assistant；无词级毒化
    */
-  if (assistantStartedThisTurn) return;
+  if (
+    shouldSkipHistoryResync({
+      assistantStartedThisTurn,
+      userStopSuppressed: isUserStopSuppressed(),
+      blockAfterStop: blockHistoryResyncAfterStop,
+    })
+  ) {
+    return;
+  }
 
   const wantSession = activeSessionId;
   const viewGen = sessionViewGen;
@@ -4464,6 +4936,21 @@ async function resyncMissingAssistantFromHistory(): Promise<void> {
   }>("history.load", { sessionId: wantSession });
   if (viewGen !== sessionViewGen || activeSessionId !== wantSession) return;
   if (!hist.ok || !hist.data?.entries?.length) return;
+  if (
+    shouldSkipHistoryResync({
+      assistantStartedThisTurn,
+      userStopSuppressed: isUserStopSuppressed(),
+      blockAfterStop: blockHistoryResyncAfterStop,
+    })
+  ) {
+    return;
+  }
+
+  const entries = hist.data.entries;
+  // 时间线 user 与 history last user 不一致 → 视图/会话竞态，跳过
+  if (!historyLastUserMatchesTimeline(entries, timelineLastUserText())) {
+    return;
+  }
 
   const shownNodes = Array.from(
     $("transcript").querySelectorAll(".line.assistant"),
@@ -4472,10 +4959,7 @@ async function resyncMissingAssistantFromHistory(): Promise<void> {
     (n.dataset.raw ?? n.textContent ?? "").trim(),
   );
 
-  for (const e of hist.data.entries) {
-    if (e.role !== "assistant" && e.role !== "ai") continue;
-    const text = (e.text ?? "").trim();
-    if (!text || text.length < 8) continue;
+  for (const text of assistantsAfterLastUser(entries)) {
     const n = normalizeAssistantForDedupe(text);
     if (!n || n.length < 12) continue;
     const exists = shownRaws.some((s) => assistantTextsRoughlyEqual(text, s));
@@ -4560,19 +5044,22 @@ async function maybeSurfacePlanAfterTurn(): Promise<void> {
 /**
  * 系统代发一条用户消息并跑一轮。
  * force：计划批准等场景下若 UI 仍标 turnActive（exit_plan 挂起/事件乱序），先 endTurn 再发。
+ * interrupt:"send_now"：cancel 当前 turn 后再发（CLI send_now）。
  * @returns 是否已成功提交到 agent（队列 L1 complete 依赖此值）
  */
 async function dispatchAgentPrompt(
   content: string,
   display?: string,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; interrupt?: "queue" | "send_now" },
 ): Promise<{ ok: boolean; error?: string }> {
   const shown = (display ?? content).trim();
   const agentText = content.trim();
   if (!agentText) return { ok: false, error: "empty" };
 
   if (turnActive) {
-    if (opts?.force) {
+    if (opts?.interrupt === "send_now") {
+      await cancelTurn({ trigger: "send_now", pauseQueue: false });
+    } else if (opts?.force) {
       // 不 cancel agent（可能已 idle）；只清 UI 锁，允许新 prompt
       // 跳过 drain：本函数紧接着 beginTurn，避免与队列竞态
       endTurn({ skipQueueDrain: true });
@@ -4584,26 +5071,28 @@ async function dispatchAgentPrompt(
 
   // 先连接再画用户气泡：避免 attach 失败留下「假已发送」消息
   showWelcome(false);
+  // 若上一轮刚停止，保持 suppress，直到 prompt 成功
   beginTurn();
   setTurnStatus(tr("chat.connecting"));
 
   const threadId = await ensureLiveThread();
   if (!threadId) {
-    endTurn();
+    endTurn({ outcome: "stopped" });
     appendLine(tr("chat.connectFail"), "error");
     return { ok: false, error: tr("chat.connectFail") };
   }
   paintUserMessage(shown);
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   setTurnStatus(tr("turn.thinking"));
+  const wireContent = await prepareAgentContentAfterCancel(threadId, agentText);
   const res = await inv("turns.prompt", {
     threadId,
-    content: agentText,
+    content: wireContent,
   });
   if (!res.ok) {
     // prompt 未进 agent：标失败气泡，勿当作已成功发出
     markLastUserMessageSendFailed();
-    endTurn();
+    endTurn({ outcome: "stopped" });
     // turn.completed(error) 可能已画过同一条；去重
     const errMsg = res.error?.message ?? tr("chat.sendFail");
     showTurnErrorOnce(
@@ -4616,6 +5105,7 @@ async function dispatchAgentPrompt(
     void refreshProjectsAndThreads();
     return { ok: false, error: errMsg };
   }
+  // 注意：arm 已在 turn.started 事件里完成（IPC 返回时整轮已结束）
   scheduleTurnSettle(currentTurnId);
   void refreshContextUsage();
   void refreshProjectsAndThreads();
@@ -6897,6 +7387,51 @@ function agentContentForSend(
 }
 
 /**
+ * Stop/Esc 后下一条发送前：
+ * conversation_only rewind：从 agent 对话里丢掉被取消的 user 轮（及之后）。
+ * UI 时间线不动，用户仍能看到「玻璃 · 已停止」。
+ *
+ * **不对齐 CLI 的旧做法（已移除）**：把长 focus `<system-reminder>` 拼进
+ * session/prompt 用户正文。那会落盘进 chat_history，切回会话后用户气泡可见。
+ *
+ * CLI 真源：cancel 后 agent 自 arm `pending_interrupt_reminder`，下一轮 user
+ * prompt 前注入独立合成项 `[Request interrupted by user]`（system_reminder，
+ * 非用户正文）。Desktop 只做 rewind + 干净 userContent。
+ */
+async function prepareAgentContentAfterCancel(
+  threadId: string,
+  userContent: string,
+): Promise<string> {
+  if (!pendingPostCancelFocus) return userContent;
+
+  const idx = lastCancelledPromptIndex;
+  // 先清 flag，避免重入；rewind 失败仍发干净用户正文
+  pendingPostCancelFocus = false;
+  lastCancelledPromptIndex = null;
+
+  if (idx != null && idx >= 0 && threadId && !threadId.startsWith("disk_")) {
+    try {
+      const rw = await inv("threads.rewind", {
+        threadId,
+        targetPromptIndex: idx,
+        force: true,
+        mode: "conversation_only",
+      });
+      if (!rw.ok) {
+        console.warn(
+          "[cancel-isolate] conversation_only rewind failed",
+          rw.error,
+        );
+      }
+    } catch (e) {
+      console.warn("[cancel-isolate] conversation_only rewind error", e);
+    }
+  }
+
+  return userContent;
+}
+
+/**
  * 解析目标正文与 `--budget N`（对齐 CLI parse_goal_budget）
  */
 function parseGoalBudget(body: string): {
@@ -7323,29 +7858,12 @@ function isLiveThreadId(id: string | null | undefined): id is string {
 }
 
 /**
- * 最小集：点「新对话」时是否需要确认。
- * 有进行中 turn / 侧栏 working / live 附着 → 弹窗；否则一键回欢迎页。
- */
-function shouldConfirmLeaveForNewChat(): boolean {
-  if (!activeSessionId && !isLiveThreadId(activeThreadId)) return false;
-  if (turnActive) return true;
-  if (activeSessionId && workingSessions.has(activeSessionId)) return true;
-  if (
-    activeSessionId &&
-    threads.some((x) => x.sessionId === activeSessionId && x.status === "working")
-  ) {
-    return true;
-  }
-  if (attachUiState === "live" || attachUiState === "attaching") return true;
-  return false;
-}
-
-/**
  * 离开当前会话 → 欢迎页。
  * 产品约定：此处不 threads.create；用户在欢迎页输入并发送后才 startNewChat。
  *
- * keepBackground=false（默认）：停 turn、detach live agent（硬离开）。
+ * keepBackground=false：停 turn、detach live agent（硬离开）。
  * keepBackground=true：对齐切会话——只清 UI，后台 agent 继续。
+ * 「新对话」默认 keepBackground=true（不弹确认）。
  *
  * 队列：默认 **保留** 各 session 的 L1 落盘队列（再打开该会话可继续）；
  * 仅 UI 镜像清空。删除会话时 Host 会删队列文件，无需此处 clear。
@@ -7374,7 +7892,8 @@ async function leaveCurrentSessionToWelcome(opts?: {
       ));
 
   if (keepBackground) {
-    // 软离开：只卸 UI 投影；磁盘队列保留；不 cancel / 不 detach
+    // 软离开：快照 turn 投影 + 卸主区；磁盘队列保留；不 cancel / 不 detach
+    if (prevSid) snapshotActiveSessionTurn(prevSid);
     if (clearQueue) {
       clearPromptQueue({ silent: true });
     } else {
@@ -7383,7 +7902,7 @@ async function leaveCurrentSessionToWelcome(opts?: {
       syncPromptQueueBar();
     }
     if (turnActive) {
-      endTurn({ skipQueueDrain: true });
+      endTurn({ skipQueueDrain: true, skipSessionStoreSync: true });
     }
   } else {
     if (turnActive) {
@@ -7457,69 +7976,15 @@ async function leaveCurrentSessionToWelcome(opts?: {
 }
 
 /**
- * 「新对话」：最小集确认后离开当前会话 → 欢迎页。
- * 默认「不保持」（cancel+detach）；可选「保持」后台继续。
+ * 「新对话」：离开当前会话 → 欢迎页。
+ * 默认 **保持** 后台 agent（与切会话一致），不弹确认框。
  */
 async function handleNewChatClick(): Promise<void> {
-  let keepBackground = false;
-  if (shouldConfirmLeaveForNewChat()) {
-    const choice = await confirmNewChatLeave();
-    if (choice === "cancel") return;
-    keepBackground = choice === "keep";
-  }
   await leaveCurrentSessionToWelcome({
     clearQueue: false,
-    keepBackground,
+    keepBackground: true,
   });
   ($("composer-input") as HTMLTextAreaElement).focus();
-}
-
-/** 新对话确认：不保持（默认主按钮）/ 保持 / 取消（含 X / 遮罩 / Esc） */
-function confirmNewChatLeave(): Promise<"discard" | "keep" | "cancel"> {
-  return new Promise((resolve) => {
-    openModal(
-      tr("nav.newChatConfirmTitle"),
-      `<p class="prompt-dlg-hint" style="white-space:pre-wrap">${esc(tr("nav.newChatConfirmBody"))}</p>
-       <div class="prompt-dlg-actions">
-         <button type="button" class="btn-ghost" id="new-chat-cancel">${esc(tr("common.cancel"))}</button>
-         <button type="button" class="btn-ghost" id="new-chat-keep">${esc(tr("nav.newChatKeep"))}</button>
-         <button type="button" class="btn-dark" id="new-chat-discard">${esc(tr("nav.newChatDiscard"))}</button>
-       </div>`,
-    );
-    let settled = false;
-    const finish = (v: "discard" | "keep" | "cancel") => {
-      if (settled) return;
-      settled = true;
-      document.removeEventListener("keydown", onKey, true);
-      // 恢复全局关闭为「只关层」；本确认已 resolve
-      $("btn-modal-close").onclick = () => closeModal();
-      $("modal").onclick = (e) => {
-        if (e.target === $("modal")) closeModal();
-      };
-      closeModal();
-      resolve(v);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        finish("cancel");
-      }
-    };
-    document.addEventListener("keydown", onKey, true);
-    // 确认期间 X / 点遮罩 = 取消（避免 Promise 悬挂）
-    $("btn-modal-close").onclick = () => finish("cancel");
-    $("modal").onclick = (e) => {
-      if (e.target === $("modal")) finish("cancel");
-    };
-    $("new-chat-cancel").onclick = () => finish("cancel");
-    $("new-chat-keep").onclick = () => finish("keep");
-    $("new-chat-discard").onclick = () => finish("discard");
-    // 主按钮默认焦点：不保持
-    requestAnimationFrame(() => {
-      ($("new-chat-discard") as HTMLButtonElement).focus();
-    });
-  });
 }
 
 /** 若归档/删除的是当前会话，退回欢迎页（保留其它会话队列；删除由 Host 清队列文件） */
@@ -7723,8 +8188,14 @@ function makeThreadRow(
   main.onclick = (e) => {
     e.stopPropagation();
     hideThreadMenu();
-    selectedProjectId = projectId;
-    expandedProjectIds.add(projectId);
+    if (projectId === CHATS_GROUP_ID) {
+      selectedProjectId = null;
+      projectChoiceTouched = true;
+      expandedProjectIds.add(CHATS_GROUP_ID);
+    } else {
+      selectedProjectId = projectId;
+      expandedProjectIds.add(projectId);
+    }
     void openThread(t);
   };
 
@@ -7800,23 +8271,32 @@ async function refreshProjectsAndThreads(): Promise<void> {
   }
 
   // Codex：项目可展开/收起；主列表默认 5 条；固定「归档」夹
+  // 「对话」与「项目」同级：#chats-list / #project-list 各一块
+  const chatsList = $("chats-list");
   const list = $("project-list");
+  chatsList.innerHTML = "";
   list.innerHTML = "";
   hideThreadMenu();
 
-  // 清理已删除项目的状态
+  // 清理已删除项目的状态（保留虚拟「对话」组 id，供归档/展开更多）
   for (const id of [...expandedProjectIds]) {
-    if (!projects.some((p) => p.id === id)) expandedProjectIds.delete(id);
+    if (id !== CHATS_GROUP_ID && !projects.some((p) => p.id === id)) {
+      expandedProjectIds.delete(id);
+    }
   }
   for (const id of [...projectShowAllThreads]) {
-    if (!projects.some((p) => p.id === id)) projectShowAllThreads.delete(id);
+    if (id !== CHATS_GROUP_ID && !projects.some((p) => p.id === id)) {
+      projectShowAllThreads.delete(id);
+    }
   }
   for (const id of [...expandedArchiveIds]) {
-    if (!projects.some((p) => p.id === id)) expandedArchiveIds.delete(id);
+    if (id !== CHATS_GROUP_ID && !projects.some((p) => p.id === id)) {
+      expandedArchiveIds.delete(id);
+    }
   }
 
   // 仅首次渲染：默认展开当前选中 / 含活动会话 / 第一个有会话的项目
-  if (!projectExpandInitialized && projects.length) {
+  if (!projectExpandInitialized) {
     projectExpandInitialized = true;
     for (const p of projects) {
       const related = threadsForProject(p.id);
@@ -7830,12 +8310,61 @@ async function refreshProjectsAndThreads(): Promise<void> {
         expandedProjectIds.add(p.id);
       }
     }
-    if (expandedProjectIds.size === 0) {
+    if (expandedProjectIds.size === 0 && projects.length) {
       const firstWith = projects.find(
         (p) => threadsForProject(p.id).some((t) => !t.archived),
       );
       if (firstWith) expandedProjectIds.add(firstWith.id);
       else expandedProjectIds.add(projects[0].id);
+    }
+  }
+
+  // 「对话」区：与「项目」同级，下列无项目会话历史
+  {
+    const chatsRelated = threadsForChatsGroup();
+    const activeList = chatsRelated.filter((t) => !t.archived);
+    const archivedList = chatsRelated.filter((t) => t.archived);
+
+    chatsList.appendChild(makeArchiveFolder(CHATS_GROUP_ID, archivedList));
+    if (!activeList.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty-threads";
+      empty.textContent = tr("chats.empty");
+      chatsList.appendChild(empty);
+    } else {
+      const showAll = projectShowAllThreads.has(CHATS_GROUP_ID);
+      const { flat, rootCount } = visibleThreadForest(
+        activeList,
+        showAll,
+        THREADS_PREVIEW_LIMIT,
+      );
+      for (const { thread, depth } of flat) {
+        chatsList.appendChild(
+          makeThreadRow(thread, CHATS_GROUP_ID, "active", depth),
+        );
+      }
+      if (rootCount > THREADS_PREVIEW_LIMIT) {
+        const more = document.createElement("button");
+        more.type = "button";
+        more.className = "project-threads-more";
+        if (showAll) {
+          more.textContent = "收起";
+          more.onclick = (e) => {
+            e.stopPropagation();
+            projectShowAllThreads.delete(CHATS_GROUP_ID);
+            void refreshProjectsAndThreads();
+          };
+        } else {
+          const rest = rootCount - THREADS_PREVIEW_LIMIT;
+          more.textContent = `展开更多（${rest}）`;
+          more.onclick = (e) => {
+            e.stopPropagation();
+            projectShowAllThreads.add(CHATS_GROUP_ID);
+            void refreshProjectsAndThreads();
+          };
+        }
+        chatsList.appendChild(more);
+      }
     }
   }
 
@@ -7990,7 +8519,7 @@ async function openThread(t: ThreadRow): Promise<void> {
   const sameSession =
     (!!activeSessionId && t.sessionId === activeSessionId) ||
     (!!activeThreadId && t.id === activeThreadId);
-  // 切会话：只清 UI turn，不 cancel 后台 agent（侧栏 working 继续转）
+  // 方案 B（对齐 CLI switch_to_agent）：切走只换焦点，快照 turn 投影，不 cancel
   const wasActivelyTurning = turnActive;
   const keepBgWorking =
     !sameSession &&
@@ -8000,10 +8529,23 @@ async function openThread(t: ThreadRow): Promise<void> {
       threads.some(
         (x) => x.sessionId === prevSid && x.status === "working",
       ));
-  endTurn({ skipQueueDrain: true }); // 切换会话时清理进行中 UI
+  if (!sameSession && prevSid) {
+    // 必须在 endTurn 之前快照（含 turnActive=true）
+    snapshotActiveSessionTurn(prevSid);
+  }
+  // 清主区 DOM/锁，勿写回 idle 覆盖 snapshot
+  endTurn({ skipQueueDrain: true, skipSessionStoreSync: true });
   if (keepBgWorking && prevSid) {
     markSessionWorking(prevSid, true);
-    // 仅从「正在跑 turn」切走时 toast，避免刷屏
+    // 确保投影仍为 running（markSessionWorking 会补 background 槽）
+    const snap = getSessionTurn(prevSid);
+    if (snap && !snap.turnActive) {
+      patchSessionTurn(prevSid, {
+        turnActive: true,
+        turnUiPhase: "working",
+        streamArmedThisTurn: true,
+      });
+    }
     if (wasActivelyTurning) {
       showToast(tr("session.bgStillRunning"), "info");
     }
@@ -8022,16 +8564,19 @@ async function openThread(t: ThreadRow): Promise<void> {
   activeSessionId = t.sessionId;
   // 默认 history_only；按 sessionId 同步真实附着（disk_ 也可能已有 live）
   setAttachUiState("history_only");
-  void inv<{
+  // 方案 B：并行查 Host 是否仍有 in-flight prompt（切回 rehydrate 真源）
+  const attachStateP = inv<{
     threadId?: string;
     state?: string;
     lastError?: string;
+    promptInFlight?: boolean;
+    threadStatus?: string;
   }>("threads.attachState", {
     threadId: t.id.startsWith("disk_") ? undefined : t.id,
     sessionId: t.sessionId,
   }).then((st) => {
-    if (viewGen !== sessionViewGen) return;
-    if (!st.ok || !st.data?.state) return;
+    if (viewGen !== sessionViewGen) return st;
+    if (!st.ok || !st.data?.state) return st;
     const s = st.data.state as AttachState;
     if (s === "live" || s === "attaching" || s === "failed") {
       setAttachUiState(s, st.data.lastError);
@@ -8044,6 +8589,7 @@ async function openThread(t: ThreadRow): Promise<void> {
     ) {
       activeThreadId = st.data.threadId;
     }
+    return st;
   });
   // L1 按会话加载持久队列（勿静默清空）
   void reloadPromptQueueFromHost();
@@ -8052,16 +8598,15 @@ async function openThread(t: ThreadRow): Promise<void> {
   // chip 跟随会话模型，不用全局默认盖住
   applyThreadToChip(t);
   startContextPolling();
-  if (t.projectId) selectedProjectId = t.projectId;
-  else {
-    const hit = projects.find((p) => {
-      const cwd = t.cwd.replace(/\\/g, "/").toLowerCase();
-      const root = p.path.replace(/\\/g, "/").toLowerCase();
-      return cwd === root || cwd.startsWith(root + "/");
-    });
-    if (hit) selectedProjectId = hit.id;
+  if (t.projectId) {
+    selectedProjectId = t.projectId;
+    expandedProjectIds.add(t.projectId);
+  } else {
+    // 无项目会话：归「对话」组，不按 cwd 误选项目
+    selectedProjectId = null;
+    projectChoiceTouched = true;
+    expandedProjectIds.add(CHATS_GROUP_ID);
   }
-  if (selectedProjectId) expandedProjectIds.add(selectedProjectId);
   showWelcome(false);
   clearTranscript();
   void refreshGoalChipFromSession();
@@ -8131,13 +8676,30 @@ async function openThread(t: ThreadRow): Promise<void> {
       if (caret) caret.textContent = "▸";
       updateProcessHeader();
     }
-    // P0-A：已加载历史 + 空闲说明（非 Working，非 system 噪声行）
+    // P0-A：已加载历史（若将 rehydrate busy，不画「已加载 · 空闲」以免与 Working 矛盾）
     const n = hist.data?.entries?.length ?? 0;
-    paintHistoryReplayDone(n);
+    const attachSt = await attachStateP;
+    const promptInFlight = attachSt?.data?.promptInFlight;
+    const hostStatus = attachSt?.data?.threadStatus ?? t.status;
+    const willBusy = shouldRehydrateBusy({
+      projection: getSessionTurn(t.sessionId),
+      sidebarWorking: workingSessions.has(t.sessionId),
+      threadStatus: hostStatus,
+      promptInFlight,
+    });
+    if (!willBusy) {
+      paintHistoryReplayDone(n);
+    }
     await refreshProjectsAndThreads();
   } finally {
     if (viewGen === sessionViewGen) {
       suspendLiveTranscript = false;
+      // 方案 B：以 Host promptInFlight 为准 rehydrate（已结束则强制 idle）
+      const attachSt = await attachStateP.catch(() => null);
+      rehydrateSessionTurnProjection(t.sessionId, {
+        threadStatus: attachSt?.data?.threadStatus ?? t.status,
+        promptInFlight: attachSt?.data?.promptInFlight,
+      });
     }
   }
 }
@@ -8403,8 +8965,9 @@ async function removeProjectFromList(
 
 async function startNewChat(prompt?: string): Promise<void> {
   let p = selectedProject();
-  let cwd: string;
+  let cwd: string | undefined;
   let projectId: string | undefined;
+  let noProject = false;
   if (p) {
     if (p.trust !== "trusted") {
       await inv("projects.update", { id: p.id, patch: { trust: "trusted" } });
@@ -8412,14 +8975,10 @@ async function startNewChat(prompt?: string): Promise<void> {
     cwd = p.path;
     projectId = p.id;
   } else {
-    // 不使用项目：一次性选择工作目录（不写入项目列表）
-    const picked = await inv<{ path: string | null; canceled?: boolean }>(
-      "system.pickDirectory",
-      { title: "选择工作目录（不添加为项目）" },
-    );
-    if (!picked.ok || picked.data?.canceled || !picked.data?.path) return;
-    cwd = picked.data.path;
+    // 不使用项目：默认 chats 工作区，不再弹选文件夹
+    noProject = true;
     projectId = undefined;
+    cwd = undefined;
   }
   // 选定工作目录后再关计划栏（取消选目录时不关）
   closePlanPanelOnSessionChange();
@@ -8487,6 +9046,7 @@ async function startNewChat(prompt?: string): Promise<void> {
   }>("threads.create", {
     cwd,
     projectId,
+    noProject: noProject || undefined,
     title: display.slice(0, 48) || tr("nav.newChat"),
     model: modelLabel,
     effort: effortLevel,
@@ -8511,6 +9071,11 @@ async function startNewChat(prompt?: string): Promise<void> {
   activeSessionId = res.data!.sessionId;
   setActiveCwd(res.data!.cwd);
   if (projectId) selectedProjectId = projectId;
+  else {
+    selectedProjectId = null;
+    projectChoiceTouched = true;
+    expandedProjectIds.add(CHATS_GROUP_ID);
+  }
   suspendLiveTranscript = false;
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   startContextPolling();
@@ -8535,7 +9100,7 @@ async function startNewChat(prompt?: string): Promise<void> {
     content: agentContent,
   });
   if (!pr.ok) {
-    endTurn();
+    endTurn({ outcome: "stopped" });
     showTurnErrorOnce(
       pr.error?.message ?? tr("chat.sendFail"),
       pr.error && "details" in pr.error
@@ -8543,7 +9108,7 @@ async function startNewChat(prompt?: string): Promise<void> {
         : undefined,
     );
   } else {
-    // 正常结束靠 turn.completed；invoke 与事件乱序时延迟兜底 + 回补末包
+    // arm 在 turn.started；此处仅 settle 兜底
     scheduleTurnSettle(currentTurnId);
   }
   void refreshContextUsage();
@@ -8901,12 +9466,36 @@ async function sendContinue(): Promise<void> {
       return;
     }
   }
-  // S19：回合进行中有输入 → 入队；无输入则保持由发送钮取消
-  if (turnActive) {
-    if (tryEnqueueFromComposer()) return;
-    await cancelTurn();
+
+  // Phase4：Cancelling / busy 发送策略
+  const hasDraft = Boolean(
+    (activeComposerInput()?.value.trim() ?? "") || composerAttachments.length,
+  );
+  const busyAction = resolveBusySendWhileCancelling({
+    cancelInFlight: Boolean(cancelTurnInFlight),
+    turnActive,
+    hasDraft,
+    busySendMode,
+  });
+  if (busyAction === "join_only") {
+    if (cancelTurnInFlight) await cancelTurnInFlight;
+    else if (turnActive) await cancelTurn({ trigger: "stop" });
     return;
   }
+  if (busyAction === "enqueue") {
+    if (tryEnqueueFromComposer()) return;
+    if (cancelTurnInFlight) await cancelTurnInFlight;
+    else if (turnActive) await cancelTurn({ trigger: "stop" });
+    return;
+  }
+  if (busyAction === "wait_then_send") {
+    // send_now：等 cancel 完成再发（或先发起 cancel）
+    if (turnActive || cancelTurnInFlight) {
+      await cancelTurn({ trigger: "send_now", pauseQueue: false });
+    }
+    // fall through 发送路径
+  }
+  // send_idle 或 send_now 后：继续下方
   const taken = takeComposerPrompt();
   if (!taken) return;
 
@@ -8932,7 +9521,7 @@ async function sendContinue(): Promise<void> {
   }
   if (activeSessionId) markSessionWorking(activeSessionId, true);
   await persistPendingGoal();
-  const agentContent = agentContentForSend(
+  const baseContent = agentContentForSend(
     taken.content,
     taken.goalTitle && !goalPaused ? taken.goalTitle : null,
   );
@@ -8943,12 +9532,16 @@ async function sendContinue(): Promise<void> {
   lastPlanArtifactPath = null;
   setTurnStatus(tr("turn.thinking"));
 
+  const agentContent = await prepareAgentContentAfterCancel(
+    threadId,
+    baseContent,
+  );
   const res = await inv("turns.prompt", {
     threadId,
     content: agentContent,
   });
   if (!res.ok) {
-    endTurn();
+    endTurn({ outcome: "stopped" });
     showTurnErrorOnce(
       res.error?.message ?? tr("chat.sendFail"),
       res.error && "details" in res.error
@@ -8956,7 +9549,7 @@ async function sendContinue(): Promise<void> {
         : undefined,
     );
   } else {
-    // 正常结束靠 turn.completed；勿在此立刻 endTurn（会丢末包）
+    // arm 在 turn.started；此处仅 settle 兜底
     scheduleTurnSettle(currentTurnId);
     void refreshContextUsage();
     void refreshProjectsAndThreads();
@@ -9317,10 +9910,14 @@ function applyDesktopConfig(cfg: {
   theme?: SettingsThemePreference;
   appearanceLight?: VariantAppearance;
   appearanceDark?: VariantAppearance;
+  busySendMode?: "queue" | "send_now";
 }): void {
   // 只更新「新对话默认」；切换供应商等操作不得覆盖当前会话的权限模式 / 模型 chip
   defaultModelLabel = cfg.defaultModel || "grok";
   defaultOpenTarget = cfg.defaultOpenTarget;
+  if (cfg.busySendMode === "send_now" || cfg.busySendMode === "queue") {
+    busySendMode = cfg.busySendMode;
+  }
   // locale 仅在显式传入且相对当前有变化时刷 DOM（切换提供商不应带 locale）
   if (cfg.locale !== undefined && cfg.locale !== localePreference) {
     localePreference = cfg.locale;
@@ -9982,6 +10579,18 @@ function onEvent(raw: unknown): void {
     handleShellNavigate((ev as { view?: string }).view || "command");
     return;
   }
+  if (ev.type === "app.update") {
+    settingsPage?.onAppUpdateEvent({
+      phase: ev.phase,
+      currentVersion: ev.currentVersion,
+      latestVersion: ev.latestVersion,
+      percent: ev.percent,
+      error: ev.error,
+      canUpdate: ev.canUpdate,
+      releasesUrl: ev.releasesUrl,
+    });
+    return;
+  }
   if (ev.type === "shell.notice") {
     handleShellNotice(
       (ev as { code?: string }).code || "",
@@ -10089,26 +10698,115 @@ function onEvent(raw: unknown): void {
       void handleDeepLinkPayload(ev.activity.slice("handoff:".length));
     }
     if (ev.sessionId) {
-      const busy =
+      // Phase4：stop/cancelling 后忽略迟到 working，避免侧栏转圈「没停」
+      const busyStatus =
         ev.status === "working" ||
         ev.status === "needs_input" ||
         ev.status === "blocked";
-      markSessionWorking(ev.sessionId, busy);
+      if (
+        busyStatus &&
+        shouldIgnoreLateSessionWorking({
+          userStopSuppressed: isUserStopSuppressed(),
+          phase: turnUiPhase,
+          eventBelongsToActiveSession: eventBelongsToActiveSession(ev),
+        })
+      ) {
+        markSessionWorking(ev.sessionId, false);
+        return;
+      }
+      markSessionWorking(ev.sessionId, busyStatus);
+      // 非 busy 时 markSessionWorking 已 markSessionTurnIdle
+      // 当前打开会话且 idle：确保主区也 idle（后台完成后再切回已由 rehydrate 处理）
+      if (
+        !busyStatus &&
+        activeSessionId === ev.sessionId &&
+        turnActive
+      ) {
+        endTurn({ skipQueueDrain: true, outcome: "worked" });
+      }
     }
     return;
   }
   // Transcript / turn 事件：按 sessionId 严格隔离（含 disk_* 浏览态）
-  // 旧逻辑在 activeThreadId=disk_* 时跳过 thread 过滤 → 后台 live 会话会污染当前页
+  // 方案 B：非当前会话仍更新 per-session 投影（不写当前 transcript）
   if (isTranscriptScopedEvent(ev) && !eventBelongsToActiveSession(ev)) {
+    const bgSid =
+      "sessionId" in ev
+        ? String((ev as { sessionId?: string }).sessionId || "")
+        : "";
+    if (bgSid) {
+      const bgProj = getSessionTurn(bgSid);
+      if (ev.type === "turn.started") {
+        patchSessionTurn(bgSid, {
+          turnActive: true,
+          turnUiPhase: "working",
+          alreadyPaintedStopped: false,
+          turnStartedAt: Date.now(),
+          streamArmedThisTurn: true,
+          assistantStartedThisTurn: false,
+          pendingAssistantText: "",
+        });
+        markSessionWorking(bgSid, true);
+      } else if (ev.type === "turn.completed") {
+        markSessionTurnIdle(bgSid);
+        markSessionWorking(bgSid, false);
+      } else if (
+        // 仅在仍认为 running 时收增量；完成后的迟到 tool/delta 不得复活 busy
+        bgProj?.turnActive &&
+        ev.type === "message.delta" &&
+        (ev as { role?: string }).role !== "user" &&
+        (ev as { text?: string }).text
+      ) {
+        appendBackgroundAssistantDelta(
+          bgSid,
+          String((ev as { text?: string }).text),
+        );
+        markSessionWorking(bgSid, true);
+      } else if (
+        bgProj?.turnActive &&
+        (ev.type === "tool.started" || ev.type === "tool.completed")
+      ) {
+        // tool.completed 不单独把已 idle 的会话拉回 working
+        if (ev.type === "tool.started") {
+          patchSessionTurn(bgSid, {
+            turnActive: true,
+            turnUiPhase: "working",
+            streamArmedThisTurn: true,
+          });
+          markSessionWorking(bgSid, true);
+        }
+      }
+    }
     return;
   }
-  // create / openThread 期间丢弃直播，避免与 history 叠双份
+  // create / openThread 期间：当前会话事件仍更新投影，不写 transcript
   if (suspendLiveTranscript) {
     if (
       ev.type === "permission.requested" &&
       eventBelongsToActiveSession(ev)
     ) {
       showPermission(ev.requestId, ev.summary);
+    }
+    if (activeSessionId && eventBelongsToActiveSession(ev)) {
+      if (ev.type === "turn.started") {
+        patchSessionTurn(activeSessionId, {
+          turnActive: true,
+          turnUiPhase: "working",
+          streamArmedThisTurn: true,
+        });
+      } else if (
+        getSessionTurn(activeSessionId)?.turnActive &&
+        ev.type === "message.delta" &&
+        (ev as { text?: string }).text
+      ) {
+        appendBackgroundAssistantDelta(
+          activeSessionId,
+          String((ev as { text?: string }).text),
+        );
+      } else if (ev.type === "turn.completed") {
+        markSessionTurnIdle(activeSessionId);
+        markSessionWorking(activeSessionId, false);
+      }
     }
     return;
   }
@@ -10120,12 +10818,19 @@ function onEvent(raw: unknown): void {
       break;
     case "thought.delta":
       showWelcome(false);
-      if (!turnActive) beginTurn();
+      // 用户停止后禁止用迟到 thought 复活 turn
+      if (!turnActive) {
+        if (isUserStopSuppressed()) break;
+        beginTurn();
+      }
       if (ev.text.trim()) appendThoughtDelta(ev.text);
       break;
     case "tool.started":
       showWelcome(false);
-      if (!turnActive) beginTurn();
+      if (!turnActive) {
+        if (isUserStopSuppressed()) break;
+        beginTurn();
+      }
       markToolStarted(ev.name || "tool", ev.toolCallId, ev.raw);
       break;
     case "tool.completed": {
@@ -10152,8 +10857,23 @@ function onEvent(raw: unknown): void {
     }
     case "turn.started":
       showWelcome(false);
-      if (!turnActive) beginTurn();
-      else setTurnStatus(tr("turn.thinking"));
+      if (!turnActive) {
+        // Phase4：cancel / suppress 后迟到 turn.started — 勿复活
+        if (
+          shouldIgnoreLateTurnStarted({
+            turnActive: false,
+            userStopSuppressed: isUserStopSuppressed(),
+            phase: turnUiPhase,
+          })
+        ) {
+          break;
+        }
+        beginTurn();
+      } else {
+        // Host 已写入 session/prompt：开闸收流
+        armTurnForLiveStream();
+        setTurnStatus(tr("turn.thinking"));
+      }
       break;
     case "turn.completed": {
       const stop = String((ev as { stopReason?: string }).stopReason || "");
@@ -10168,9 +10888,33 @@ function onEvent(raw: unknown): void {
       const lastToolFailure = String(
         (ev as { lastToolFailure?: string }).lastToolFailure || "",
       ).trim();
-      endTurn();
+      const isCancelled =
+        stop === "cancelled" ||
+        stop === "canceled" ||
+        stop === "user_cancelled" ||
+        /cancel/i.test(stop);
+      // Phase4：UI 已 stopped / suppress → 只清 working，不二次 paint
+      if (
+        shouldIgnoreCancelledTurnCompleted({
+          turnActive,
+          alreadyPaintedStopped,
+          userStopSuppressed: isUserStopSuppressed(),
+          isCancelled,
+        })
+      ) {
+        if (activeSessionId) markSessionWorking(activeSessionId, false);
+        setComposerBusy(false);
+        void syncGoalFromAgent();
+        void refreshContextUsage();
+        break;
+      }
+      // 用户停止语义：统一 stopped 文案（非 worked）
+      endTurn({ outcome: isCancelled ? "stopped" : "worked" });
       // 超时/错误：只走友好标题；与 turns.prompt 失败共用 showTurnErrorOnce 去重
-      if (stop === "timeout" || /timed out/i.test(errMsg)) {
+      // 取消不画错误/空回复提示
+      if (isCancelled) {
+        /* already painted stopped */
+      } else if (stop === "timeout" || /timed out/i.test(errMsg)) {
         showTurnErrorOnce(errMsg || "timeout");
       } else if (errMsg && stop === "error") {
         showTurnErrorOnce(errMsg);
@@ -10189,27 +10933,46 @@ function onEvent(raw: unknown): void {
           appendLine(tr("chat.turnToolsOnly"), "system");
         }
       } else if (!hadText && !hadTools) {
-        appendLine(
-          tr("chat.turnEmpty") ||
-            "Turn finished with no assistant reply. Check agent logs or retry.",
-          "system",
-        );
+        // 停止后隔离丢弃了串流时 hadText=false — 勿吓人「没有助手回复」
+        if (!blockHistoryResyncAfterStop && !isUserStopSuppressed()) {
+          appendLine(
+            tr("chat.turnEmpty") ||
+              "Turn finished with no assistant reply. Check agent logs or retry.",
+            "system",
+          );
+        }
       } else if (!hadText && hadTools) {
-        appendLine(
-          tr("chat.turnToolsOnly") ||
-            "Turn finished after tools ran, but no final reply text was streamed.",
-          "system",
-        );
+        if (!blockHistoryResyncAfterStop && !isUserStopSuppressed()) {
+          appendLine(
+            tr("chat.turnToolsOnly") ||
+              "Turn finished after tools ran, but no final reply text was streamed.",
+            "system",
+          );
+        }
       }
       void syncGoalFromAgent();
       void refreshContextUsage();
       sidePane?.scheduleRefreshFileTree(400);
-      void afterTurnSettled();
+      // Phase3：stop block / suppress / 已流式 → 跳过 resync
+      if (
+        shouldSkipHistoryResync({
+          assistantStartedThisTurn,
+          userStopSuppressed: isUserStopSuppressed(),
+          blockAfterStop: blockHistoryResyncAfterStop,
+        })
+      ) {
+        void maybeSurfacePlanAfterTurn();
+      } else {
+        void afterTurnSettled();
+      }
       break;
     }
     case "ask_user.requested": {
       showWelcome(false);
-      if (!turnActive) beginTurn();
+      if (!turnActive) {
+        if (isUserStopSuppressed()) break;
+        beginTurn();
+      }
       setTurnStatus(tr("askUser.waiting") || "等待你的选择…");
       void showAskUserDialog(ev);
       break;
@@ -10370,8 +11133,7 @@ npm start</pre>
     }
     fi.value = "";
     if (turnActive) {
-      if (tryEnqueueFromComposer()) return;
-      void cancelTurn();
+      void sendContinue();
       return;
     }
     if (activeThreadId || activeSessionId) void sendContinue();
@@ -10574,6 +11336,7 @@ npm start</pre>
     e.stopPropagation();
     selectedProjectId = null;
     projectChoiceTouched = true;
+    expandedProjectIds.add(CHATS_GROUP_ID);
     closeProjectPicker();
     setWelcomeTitle();
     showWelcome(true);
@@ -10655,20 +11418,15 @@ npm start</pre>
   };
 
   $("btn-send").onclick = () => {
-    // 欢迎页：busy 时停止；否则新会话
-    if (turnActive) void cancelTurn();
+    // 欢迎页：busy 时按 busySendMode / 无输入则 stop；否则新会话
+    if (turnActive) void sendContinue();
     else void startNewChat();
   };
   $("btn-send-chat").onclick = () => {
-    // 停止钮：始终取消当前 turn（队列保留，结束后继续发）
-    // 若想清空队列：用排队条「清空」
+    // busy：有草稿 → queue 或 send_now；无草稿 → stop
+    // 空闲：发送
     if (turnActive) {
-      const chatIn = ($("chat-input") as HTMLTextAreaElement).value.trim();
-      if (chatIn || composerAttachments.length) {
-        // 有草稿时优先入队（对齐 Codex：发送=排队，停止需点空输入的 ■）
-        if (tryEnqueueFromComposer()) return;
-      }
-      void cancelTurn();
+      void sendContinue();
       return;
     }
     void sendContinue();
@@ -10680,11 +11438,8 @@ npm start</pre>
     }
     if (ke.key === "Enter" && !ke.shiftKey) {
       e.preventDefault();
-      if (turnActive) {
-        // 欢迎页进行中：有输入则入队，否则停止
-        if (tryEnqueueFromComposer()) return;
-        void cancelTurn();
-      } else void startNewChat();
+      if (turnActive) void sendContinue();
+      else void startNewChat();
     }
   });
   $("chat-input").addEventListener("keydown", (e) => {
@@ -10694,10 +11449,7 @@ npm start</pre>
     }
     if (ke.key === "Enter" && !ke.shiftKey) {
       e.preventDefault();
-      if (turnActive) {
-        if (tryEnqueueFromComposer()) return;
-        void cancelTurn();
-      } else void sendContinue();
+      void sendContinue();
     }
   });
   $("focus-input").addEventListener(
@@ -10761,6 +11513,20 @@ npm start</pre>
 
   document.addEventListener("keydown", (e) => {
     const ev = e as KeyboardEvent;
+    // Esc：停止当前 turn（CLI cancelTrigger=esc）；模态打开时留给关闭逻辑
+    if (
+      ev.key === "Escape" &&
+      !ev.ctrlKey &&
+      !ev.altKey &&
+      !ev.metaKey &&
+      turnActive
+    ) {
+      const modal = document.getElementById("modal");
+      if (modal && !modal.classList.contains("hidden")) return;
+      e.preventDefault();
+      void cancelTurn({ trigger: "esc" });
+      return;
+    }
     // Shift+Tab：循环 normal → plan → always_approve（对齐 CLI）
     // 输入框内 Tab 缩进不拦截；仅 Shift+Tab
     if (ev.shiftKey && !ev.ctrlKey && !ev.altKey && ev.key === "Tab") {
@@ -10815,6 +11581,7 @@ npm start</pre>
     theme?: SettingsThemePreference;
     appearanceLight?: VariantAppearance;
     appearanceDark?: VariantAppearance;
+    busySendMode?: "queue" | "send_now";
   }>("config.get");
   if (cfg.data) {
     const mode =
@@ -10830,6 +11597,8 @@ npm start</pre>
       theme: themePref,
       appearanceLight: cfg.data.appearanceLight,
       appearanceDark: cfg.data.appearanceDark,
+      busySendMode:
+        cfg.data.busySendMode === "send_now" ? "send_now" : "queue",
     });
   } else {
     setLocale(resolveLocale("system", navigator.language));

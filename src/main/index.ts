@@ -29,6 +29,13 @@ import {
   shellNoticeEvent,
   type ShellNavigateView,
 } from "../shared/events.js";
+import {
+  initAppUpdater,
+  getAppUpdateState,
+  checkForAppUpdate,
+  downloadAppUpdate,
+  installAppUpdate,
+} from "./app-updater.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** 应用根（dist/main → ../.. = 项目根） */
@@ -609,13 +616,26 @@ async function handleHostIpc(
           targetPromptIndex: Number(p.targetPromptIndex),
           // 默认 true：确认后真正执行（agent force=false 只预览）
           force: p.force !== false,
+          mode:
+            p.mode === "conversation_only" || p.mode === "files_only"
+              ? (p.mode as "conversation_only" | "files_only")
+              : p.mode === "all"
+                ? "all"
+                : undefined,
         }),
       );
     case "turns.prompt":
       await host.turnsPrompt(p.threadId as string, p.content as string);
       return resultOk({ sent: true });
     case "turns.cancel":
-      await host.turnsCancel(p.threadId as string);
+      await host.turnsCancel(p.threadId as string, {
+        trigger:
+          typeof p.trigger === "string" ? (p.trigger as string) : undefined,
+        cancelPromptId:
+          typeof p.cancelPromptId === "string"
+            ? (p.cancelPromptId as string)
+            : undefined,
+      });
       return resultOk({ cancelled: true });
     case "permissions.respond":
       host.permissionsRespond(p.requestId as string, p.decision as never);
@@ -878,6 +898,14 @@ async function handleHostIpc(
       return resultOk(host.shellVersionMatrix());
     case "shell.readHandoff":
       return resultOk(host.shellReadHandoff());
+    case "app.update.status":
+      return resultOk(getAppUpdateState());
+    case "app.update.check":
+      return resultOk(await checkForAppUpdate());
+    case "app.update.download":
+      return resultOk(await downloadAppUpdate());
+    case "app.update.install":
+      return resultOk(installAppUpdate());
     case "pr.list":
       return resultOk(
         host.prList(p.cwd as string, p.limit as number | undefined),
@@ -1253,6 +1281,10 @@ app.whenReady().then(async () => {
     } catch (err) {
       return resultErr(err);
     }
+  });
+
+  initAppUpdater({
+    getMainWindow: () => (windowAlive() ? mainWindow : null),
   });
 
   await createWindow();

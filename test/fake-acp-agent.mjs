@@ -10,6 +10,8 @@ import { randomUUID } from "node:crypto";
 const rl = readline.createInterface({ input: process.stdin });
 let sessionId = null;
 const askPermission = process.env.FAKE_ACP_ASK_PERMISSION === "1";
+/** When set, session/prompt hangs until session/cancel (mid-turn cancel tests). */
+let hungPromptId = null;
 
 function write(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
@@ -105,11 +107,50 @@ rl.on("line", async (line) => {
   }
 
   if (method === "session/cancel") {
-    write({ jsonrpc: "2.0", id, result: {} });
+    // ACP CancelNotification: real agent accepts notification (no id).
+    // Desktop must send notify; tests may still send request with id.
+    const cancelLog = process.env.FAKE_ACP_CANCEL_LOG;
+    if (cancelLog) {
+      try {
+        const prev = fs.existsSync(cancelLog)
+          ? JSON.parse(fs.readFileSync(cancelLog, "utf8"))
+          : [];
+        const list = Array.isArray(prev) ? prev : [prev];
+        list.push({
+          ...(params ?? {}),
+          _testWire: id != null ? "request" : "notification",
+        });
+        fs.writeFileSync(cancelLog, JSON.stringify(list, null, 2), "utf8");
+      } catch {
+        /* ignore */
+      }
+    }
+    // Resolve hung prompt if mid-turn cancel test
+    if (hungPromptId != null) {
+      write({
+        jsonrpc: "2.0",
+        id: hungPromptId,
+        result: { stopReason: "cancelled" },
+      });
+      hungPromptId = null;
+    }
+    // Only respond when client used request (id present)
+    if (id != null) {
+      write({ jsonrpc: "2.0", id, result: {} });
+    }
     return;
   }
 
   if (method === "session/prompt") {
+    // Mid-turn cancel tests: hold the prompt open until session/cancel
+    if (process.env.FAKE_ACP_SLOW_PROMPT === "1") {
+      hungPromptId = id;
+      notifyUpdate({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "slow…" },
+      });
+      return;
+    }
     const text =
       params?.prompt?.[0]?.text ??
       params?.prompt?.find?.((p) => p.type === "text")?.text ??

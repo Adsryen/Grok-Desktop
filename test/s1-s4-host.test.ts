@@ -178,3 +178,45 @@ describe("S4 automations / extensibility", () => {
     expect(host.configGet().defaultModel).toBe("grok-build");
   });
 });
+
+describe("no-project chats group", () => {
+  it("threadsCreate noProject uses chats workspace and stays unbound", async () => {
+    const host = makeHost();
+    const repo = tempRepo();
+    // 即便登记了项目，noProject 也不应挂上
+    host.projectsAdd({ path: repo, trust: true });
+
+    const created = await host.threadsCreate({
+      noProject: true,
+      title: "loose-chat",
+      alwaysApprove: true,
+    });
+    expect(created.sessionId).toBeTruthy();
+    expect(created.cwd.replace(/\\/g, "/")).toMatch(/chats-workspace$/);
+    expect(fs.existsSync(created.cwd)).toBe(true);
+
+    const listed = host.listThreads();
+    const row = listed.find((t) => t.sessionId === created.sessionId);
+    expect(row).toBeTruthy();
+    expect(row?.projectId).toBeUndefined();
+    expect(row?.title).toContain("loose");
+  });
+
+  it("noProject still works when cwd is under a project path", async () => {
+    const host = makeHost();
+    const repo = tempRepo();
+    host.projectsAdd({ path: repo, trust: true });
+
+    const created = await host.threadsCreate({
+      noProject: true,
+      cwd: repo,
+      title: "under-repo-but-loose",
+      alwaysApprove: true,
+    });
+    const row = host
+      .listThreads()
+      .find((t) => t.sessionId === created.sessionId);
+    expect(row?.projectId).toBeUndefined();
+    expect(row?.cwd).toBe(path.resolve(repo));
+  });
+});

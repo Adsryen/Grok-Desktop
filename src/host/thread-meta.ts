@@ -17,6 +17,11 @@ export interface SessionMetaEntry {
   effort?: string;
   /** 侧栏置顶（按 sessionId 持久化，disk/live 通用） */
   pinned?: boolean;
+  /**
+   * 「不使用项目」会话：listThreads 不按 cwd 自动挂到项目，
+   * 侧栏归入「对话」组。
+   */
+  noProject?: boolean;
 }
 
 function isEmptyMeta(entry: SessionMetaEntry): boolean {
@@ -25,7 +30,8 @@ function isEmptyMeta(entry: SessionMetaEntry): boolean {
     !entry.title &&
     !entry.model &&
     !entry.effort &&
-    !entry.pinned
+    !entry.pinned &&
+    !entry.noProject
   );
 }
 
@@ -101,6 +107,26 @@ export class ThreadMetaStore {
 
   isPinned(sessionId: string): boolean {
     return this.get(sessionId).pinned === true;
+  }
+
+  isNoProject(sessionId: string): boolean {
+    return this.get(sessionId).noProject === true;
+  }
+
+  setNoProject(sessionId: string, noProject: boolean): SessionMetaEntry {
+    if (!sessionId) return {};
+    const data = this.read();
+    const prev = data.sessions[sessionId] ?? {};
+    if (noProject) {
+      data.sessions[sessionId] = { ...prev, noProject: true };
+    } else if (data.sessions[sessionId]) {
+      const next = { ...prev };
+      delete next.noProject;
+      if (isEmptyMeta(next)) delete data.sessions[sessionId];
+      else data.sessions[sessionId] = next;
+    }
+    this.write(data);
+    return data.sessions[sessionId] ?? {};
   }
 
   setPinned(sessionId: string, pinned: boolean): SessionMetaEntry {

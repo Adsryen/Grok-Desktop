@@ -31,6 +31,14 @@ export function desktopLogsDir(home = os.homedir()): string {
   return path.join(desktopDir(home), "logs");
 }
 
+/**
+ * 「不使用项目」会话的默认 cwd：`~/.grok-desktop/desktop/chats-workspace`
+ * 与项目列表解耦，避免误绑到已登记项目路径。
+ */
+export function chatsWorkspaceDir(home = os.homedir()): string {
+  return path.join(desktopDir(home), "chats-workspace");
+}
+
 export function sessionsRoot(home = os.homedir()): string {
   return path.join(grokHomeDir(home), "sessions");
 }

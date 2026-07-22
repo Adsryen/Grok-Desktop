@@ -230,6 +230,30 @@ export type NormalizedEvent =
       message?: string;
       at?: string;
     }
+  /** 应用更新进度（设置 → 关于；手动检查/下载） */
+  | {
+      type: "app.update";
+      phase:
+        | "idle"
+        | "checking"
+        | "available"
+        | "not-available"
+        | "downloading"
+        | "downloaded"
+        | "error";
+      currentVersion: string;
+      latestVersion?: string;
+      releaseName?: string;
+      releaseNotes?: string;
+      percent?: number;
+      bytesPerSecond?: number;
+      transferred?: number;
+      total?: number;
+      error?: string;
+      canUpdate: boolean;
+      releasesUrl: string;
+      at?: string;
+    }
   /** Mode B 附着状态 */
   | {
       type: "session.attach_state";

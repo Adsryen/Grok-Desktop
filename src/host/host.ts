@@ -92,6 +92,7 @@ import {
 import { InboxStore } from "./inbox.js";
 import { HostLogger } from "./logger.js";
 import {
+  chatsWorkspaceDir,
   desktopDir,
   encodeCwdForSessionDir,
   ensureDesktopDirs,
@@ -473,8 +474,14 @@ export class DesktopHost {
     defaultOpenTarget?: string;
     locale?: "zh-CN" | "en-US" | "system";
     theme?: "system" | "light" | "dark";
+    idleDetachMs?: number;
+    maxLiveAttaches?: number;
+    busySendMode?: "queue" | "send_now";
+    appearanceLight?: unknown;
+    appearanceDark?: unknown;
+    experimentalMemory?: boolean;
   }) {
-    const view = writeDesktopConfig(patch, this.home);
+    const view = writeDesktopConfig(patch as Parameters<typeof writeDesktopConfig>[0], this.home);
     if (patch.grokPathOverride !== undefined) {
       this.resolveOpts.overridePath = patch.grokPathOverride || null;
     }
@@ -532,25 +539,30 @@ export class DesktopHost {
     for (const r of roster) {
       if (seen.has(r.sessionId)) continue;
       seen.add(r.sessionId);
-      const projectId =
-        r.projectId ?? this.projects.findByPath(r.cwd)?.id ?? undefined;
-      // Prefix match: session cwd under project root
-      let resolvedProjectId = projectId;
-      if (!resolvedProjectId) {
-        const nCwd = path.resolve(r.cwd).toLowerCase().replace(/\\/g, "/");
-        for (const p of this.projects.list({ includeArchived: true })) {
-          const nP = path.resolve(p.path).toLowerCase().replace(/\\/g, "/");
-          if (nCwd === nP || nCwd.startsWith(nP + "/")) {
-            resolvedProjectId = p.id;
-            break;
-          }
-        }
-      }
       // 再滤一层：live 标题若像 goal 基建会话也隐藏
       if (isGoalInfraSessionTitle(r.title)) continue;
       const archived = this.threadMeta.isArchived(r.sessionId);
       const customTitle = this.threadMeta.getTitle(r.sessionId);
       const smeta = this.threadMeta.get(r.sessionId);
+      // 「不使用项目」：不按 cwd 自动挂项目，侧栏归「对话」组
+      let resolvedProjectId: string | undefined;
+      if (smeta.noProject) {
+        resolvedProjectId = undefined;
+      } else {
+        const projectId =
+          r.projectId ?? this.projects.findByPath(r.cwd)?.id ?? undefined;
+        resolvedProjectId = projectId;
+        if (!resolvedProjectId) {
+          const nCwd = path.resolve(r.cwd).toLowerCase().replace(/\\/g, "/");
+          for (const p of this.projects.list({ includeArchived: true })) {
+            const nP = path.resolve(p.path).toLowerCase().replace(/\\/g, "/");
+            if (nCwd === nP || nCwd.startsWith(nP + "/")) {
+              resolvedProjectId = p.id;
+              break;
+            }
+          }
+        }
+      }
       const liveHit = live.find((t) => t.sessionId === r.sessionId);
       // fork 元数据：roster 磁盘行已带；live 行从 summary 补读
       let sessionKind = r.sessionKind ?? liveHit?.sessionKind;
@@ -662,14 +674,24 @@ export class DesktopHost {
     params: ThreadsCreateParams,
   ): Promise<ThreadsCreateResult> {
     this.assertNotDisposed();
-    let cwd = path.resolve(params.cwd);
+    const noProject = params.noProject === true;
+    let cwdInput = (params.cwd ?? "").toString().trim();
+    if (noProject && !cwdInput) {
+      const dir = chatsWorkspaceDir(this.home);
+      fs.mkdirSync(dir, { recursive: true });
+      cwdInput = dir;
+    }
+    if (!cwdInput) {
+      throw new HostError("INVALID_ARGUMENT", "cwd required");
+    }
+    let cwd = path.resolve(cwdInput);
     if (!fs.existsSync(cwd)) {
       throw new HostError("IO_ERROR", `cwd does not exist: ${cwd}`);
     }
 
-    // Project trust gate
-    let projectId = params.projectId;
-    if (!projectId) {
+    // Project trust gate（noProject 强制不挂项目）
+    let projectId = noProject ? undefined : params.projectId;
+    if (!noProject && !projectId) {
       const found = this.projects.findByPath(cwd);
       if (found) projectId = found.id;
     }
@@ -682,7 +704,9 @@ export class DesktopHost {
         );
       }
       if (proj) {
-        cwd = path.resolve(params.cwd.startsWith(proj.path) ? params.cwd : proj.path);
+        cwd = path.resolve(
+          cwdInput.startsWith(proj.path) ? cwdInput : proj.path,
+        );
         this.projects.touch(projectId);
       }
     }
@@ -817,6 +841,9 @@ export class DesktopHost {
         model: thread.model,
         effort: thread.effort,
       });
+      if (noProject) {
+        this.threadMeta.setNoProject(sessionId, true);
+      }
       if (worktreeId) this.worktrees.bindSession(worktreeId, sessionId);
 
       const live = this.threads.get(threadId);
@@ -1074,6 +1101,9 @@ export class DesktopHost {
     state: AttachState;
     sessionId: string;
     alive: boolean;
+    /** session/prompt 是否仍在飞（切回 rehydrate 真源） */
+    promptInFlight?: boolean;
+    threadStatus?: string;
   } {
     const live = this.threads.get(threadId);
     if (!live) {
@@ -1086,6 +1116,8 @@ export class DesktopHost {
         state: live.attachState,
         sessionId,
         alive: false,
+        promptInFlight: false,
+        threadStatus: live.thread.status,
       };
     }
     const alive = live.client.isAlive();
@@ -1096,11 +1128,25 @@ export class DesktopHost {
       live.lastAttachError = "Agent process not alive";
       live.thread.status = "failed";
       this.emitAttachState(threadId, sessionId, "failed", live.lastAttachError);
-      return { ok: false, state: "failed", sessionId, alive: false };
+      return {
+        ok: false,
+        state: "failed",
+        sessionId,
+        alive: false,
+        promptInFlight: false,
+        threadStatus: "failed",
+      };
     }
     live.lastActiveAtMs = Date.now();
     live.attachState = "live";
-    return { ok: true, state: "live", sessionId, alive: true };
+    return {
+      ok: true,
+      state: "live",
+      sessionId,
+      alive: true,
+      promptInFlight: live.client.isPromptInFlight(),
+      threadStatus: live.thread.status,
+    };
   }
 
   threadsAttachState(
@@ -1112,6 +1158,9 @@ export class DesktopHost {
     lastError?: string;
     attachedAt?: string;
     lastActiveAt?: string;
+    /** 是否仍有 in-flight session/prompt */
+    promptInFlight?: boolean;
+    threadStatus?: string;
   } {
     let live: LiveThread | undefined;
     if (threadIdOrSession.threadId) {
@@ -1124,6 +1173,8 @@ export class DesktopHost {
       return {
         sessionId: threadIdOrSession.sessionId ?? "",
         state: "history_only",
+        promptInFlight: false,
+        threadStatus: "idle",
       };
     }
     // refresh failed if process died
@@ -1142,6 +1193,8 @@ export class DesktopHost {
       lastActiveAt: live.lastActiveAtMs
         ? new Date(live.lastActiveAtMs).toISOString()
         : undefined,
+      promptInFlight: live.client?.isPromptInFlight() ?? false,
+      threadStatus: live.thread.status,
     };
   }
 
@@ -1625,12 +1678,17 @@ export class DesktopHost {
   }
 
   /**
-   * 执行完整回退（对话+文件，mode=all，force=true 才真正落盘）。
-   * targetPromptIndex：恢复到该 user prompt 执行前。
+   * 执行回退。默认 mode=all（对话+文件）；
+   * conversation_only：只砍 agent 上下文（Stop 后隔离用，不改文件）。
+   * force=true 才真正执行。
    */
   async threadsRewind(
     threadId: string,
-    params: { targetPromptIndex: number; force?: boolean },
+    params: {
+      targetPromptIndex: number;
+      force?: boolean;
+      mode?: "all" | "conversation_only" | "files_only";
+    },
   ): Promise<{
     success: boolean;
     targetPromptIndex: number;
@@ -1644,14 +1702,17 @@ export class DesktopHost {
     const live = this.requireWritable(threadId);
     // agent：force=false 只预览；真正执行必须 force=true
     const force = params.force !== false;
+    const mode = params.mode ?? "all";
     const res = await live.client!.rewindExecute(params.targetPromptIndex, {
       force,
+      mode,
     });
     this.logger.info("threads.rewind", {
       threadId,
       sessionId: live.thread.sessionId,
       targetPromptIndex: params.targetPromptIndex,
       force,
+      mode,
       success: res.success,
       reverted: res.reverted_files?.length ?? 0,
       error: res.error,
@@ -1855,9 +1916,15 @@ export class DesktopHost {
     await live.client!.prompt(content);
   }
 
-  async turnsCancel(threadId: string): Promise<void> {
+  async turnsCancel(
+    threadId: string,
+    opts?: { trigger?: string; cancelPromptId?: string },
+  ): Promise<void> {
     const live = this.requireWritable(threadId);
-    await live.client!.cancel();
+    await live.client!.cancel({
+      trigger: opts?.trigger,
+      cancelPromptId: opts?.cancelPromptId,
+    });
   }
 
   permissionsRespond(requestId: string, decision: PermissionDecision): void {

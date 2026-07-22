@@ -110,10 +110,18 @@ export interface GrokInfo {
 export type WorktreeMode = "use_main" | "create_new" | "attach_existing";
 
 export interface ThreadsCreateParams {
-  cwd: string;
+  /**
+   * 工作目录。`noProject` 且省略时，Host 使用 Desktop 专用 chats 工作区。
+   */
+  cwd?: string;
   title?: string;
   prompt?: string;
   projectId?: string;
+  /**
+   * 不绑定项目（侧栏「对话」组）。
+   * 为 true 时不按 cwd 自动挂项目；cwd 缺省则用 chats 工作区。
+   */
+  noProject?: boolean;
   model?: string;
   /** 推理力度；写入 session _meta.reasoningEffort */
   effort?: ReasoningEffort | string;

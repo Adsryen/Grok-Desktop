@@ -100,6 +100,30 @@ describe("chat history parsing (UI transcript)", () => {
     expect(cleanUserText("<user_query>\nhello\n</user_query>")).toBe("hello");
   });
 
+  it("cleanUserText strips injected cancel system-reminder, keeps user body", () => {
+    const raw =
+      `<system-reminder>\n` +
+      `The previous user turn ("玻璃") was cancelled and removed from active context. Do NOT search, continue, or mention that topic.\n` +
+      `Answer ONLY the new standalone user message below.\n` +
+      `</system-reminder>\n\n` +
+      `苹果`;
+    expect(cleanUserText(raw)).toBe("苹果");
+    // 纯 reminder → map 丢弃
+    expect(
+      mapHistoryLine({
+        type: "user",
+        content: [{ type: "text", text: raw.replace(/\n\n苹果$/, "") }],
+      }),
+    ).toBeNull();
+    // 混排 → 只露用户正文
+    expect(
+      mapHistoryLine({
+        type: "user",
+        content: [{ type: "text", text: raw }],
+      }),
+    ).toEqual({ role: "user", text: "苹果" });
+  });
+
   it("loadChatHistory from real-shaped chat_history.jsonl", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "grok-hist-"));
     const cwdEnc = encodeURIComponent("D:\\spiderMonkey\\test");

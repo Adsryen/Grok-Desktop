@@ -121,11 +121,100 @@ describe("contract audit", () => {
     expect(acp).toMatch(/hadToolActivityThisTurn/);
     expect(acp).toMatch(/error: message/);
     const renderer = read("src/renderer/main.ts");
-    expect(renderer).toMatch(/chat\.turnTimeout/);
+    // 超时/空回合文案走 i18n key；renderer 用 tr() 引用
+    expect(renderer).toMatch(/chat\.turnEmpty|chat\.turnToolFailed|showTurnErrorOnce/);
     const settings = read("src/renderer/settings-page.ts");
     expect(settings).toMatch(/settings\.perm\.fullConfirm/);
     const en = read("src/shared/i18n/locales/en-US.ts");
     expect(en).toMatch(/chat\.turnTimeout/);
     expect(en).toMatch(/settings\.perm\.fullConfirm/);
+  });
+
+  it("session/cancel CLI meta + Stop/Esc trigger paths exist", () => {
+    const acp = read("src/host/acp-client.ts");
+    expect(acp).toMatch(/cancelSubagents:\s*true/);
+    expect(acp).toMatch(/cancelTrigger/);
+    expect(acp).toMatch(/cancelPromptId/);
+    expect(acp).toMatch(/rewindIfPristine:\s*false/);
+    // ROOT: cancel must be ACP notification (notify), not request
+    expect(acp).toMatch(/notify\(\s*["']session\/cancel["']/);
+    expect(acp).toMatch(/CancelNotification|wire:\s*["']notification["']/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/trigger:\s*"stop"/);
+    expect(renderer).toMatch(/trigger:\s*"esc"/);
+    const main = read("src/main/index.ts");
+    expect(main).toMatch(/turns\.cancel/);
+    expect(main).toMatch(/cancelPromptId/);
+  });
+
+  it("busySendMode queue vs send_now wiring exists", () => {
+    const ext = read("src/host/extensibility.ts");
+    expect(ext).toMatch(/busySendMode/);
+    expect(ext).toMatch(/"send_now"/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/busySendMode/);
+    expect(renderer).toMatch(/trigger:\s*"send_now"/);
+    expect(renderer).toMatch(/pauseQueue:\s*false/);
+    const settings = read("src/renderer/settings-page.ts");
+    expect(settings).toMatch(/busySend/);
+    const zh = read("src/shared/i18n/locales/zh-CN.ts");
+    expect(zh).toMatch(/settings\.busySend/);
+  });
+
+  it("turn UI settle state machine (Phase 4) exists", () => {
+    const sm = read("src/shared/turn-ui-state.ts");
+    expect(sm).toMatch(/shouldPaintStoppedPhase/);
+    expect(sm).toMatch(/shouldIgnoreCancelledTurnCompleted/);
+    expect(sm).toMatch(/shouldIgnoreLateTurnStarted/);
+    expect(sm).toMatch(/resolveBusySendWhileCancelling/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/alreadyPaintedStopped/);
+    expect(renderer).toMatch(/turnUiPhase/);
+    expect(renderer).toMatch(/shouldIgnoreCancelledTurnCompleted/);
+  });
+
+  it("scheme B: per-session turn projection store exists", () => {
+    const store = read("src/renderer/session-turn-store.ts");
+    expect(store).toMatch(/SessionTurnProjection/);
+    expect(store).toMatch(/shouldRehydrateBusy/);
+    expect(store).toMatch(/appendBackgroundAssistantDelta/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/snapshotActiveSessionTurn/);
+    expect(renderer).toMatch(/rehydrateSessionTurnProjection/);
+    expect(renderer).toMatch(/skipSessionStoreSync/);
+  });
+
+  it("post-cancel: conversation_only rewind only (no Desktop focus system-reminder inject)", () => {
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/prepareAgentContentAfterCancel/);
+    expect(renderer).toMatch(/pendingPostCancelFocus/);
+    expect(renderer).toMatch(/conversation_only/);
+    // 禁止回归：把 focus system-reminder 拼进用户 prompt（会落盘进气泡）
+    expect(renderer).not.toMatch(
+      /Answer ONLY the new standalone user message below/,
+    );
+    expect(renderer).not.toMatch(
+      /was cancelled and removed from active context/,
+    );
+    const acp = read("src/host/acp-client.ts");
+    expect(acp).toMatch(/conversation_only/);
+    // paintTurnPhaseDone 须 append 末尾
+    expect(renderer).toMatch(
+      /钉回末尾|钉在 transcript \*\*末尾\*\*|root\.appendChild\(turnPhaseEl\)/,
+    );
+  });
+
+  it("history resync policy: arm does not clear stop block; no bleed poison", () => {
+    const policy = read("src/shared/history-resync-policy.ts");
+    expect(policy).toMatch(/armClearsHistoryResyncBlock/);
+    expect(policy).toMatch(/shouldSkipHistoryResync/);
+    expect(policy).toMatch(/assistantsAfterLastUser/);
+    const renderer = read("src/renderer/main.ts");
+    expect(renderer).toMatch(/shouldSkipHistoryResync/);
+    expect(renderer).toMatch(/history-resync-policy/);
+    // 禁止回归词级毒化
+    expect(renderer).not.toMatch(/looksLikeStoppedTurnBleed|purgePoisonedTurnUi|bleedFingerprints/);
+    const acp = read("src/host/acp-client.ts");
+    expect(acp).not.toMatch(/bleedFingerprints|filterAssistantBleed|looksLikeCancelledBleed/);
   });
 });

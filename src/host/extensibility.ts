@@ -295,6 +295,12 @@ export interface DesktopConfig {
   idleDetachMs?: number;
   /** 同时 live 附着上限 */
   maxLiveAttaches?: number;
+  /**
+   * 回合进行中再次发送：
+   * - `queue`（默认）：入 follow-up 队列，不 cancel
+   * - `send_now`：cancel 当前 turn（trigger=send_now）并立即发新消息
+   */
+  busySendMode?: "queue" | "send_now";
 }
 
 export interface DesktopConfigView extends DesktopConfig {
@@ -358,12 +364,15 @@ export function getDesktopConfigView(home?: string): DesktopConfigView {
     raw.theme === "light" || raw.theme === "dark" || raw.theme === "system"
       ? raw.theme
       : "system";
+  const busySendMode: "queue" | "send_now" =
+    raw.busySendMode === "send_now" ? "send_now" : "queue";
   return {
     ...raw,
     defaultPermMode,
     defaultOpenTarget: raw.defaultOpenTarget ?? "explorer",
     alwaysApproveDefault: defaultPermMode === "always_approve",
     theme,
+    busySendMode,
     appearanceLight: normalizeVariantAppearance(raw.appearanceLight, "light"),
     appearanceDark: normalizeVariantAppearance(raw.appearanceDark, "dark"),
     paths: {
@@ -417,6 +426,10 @@ export function writeDesktopConfig(
       patch.appearanceDark,
       "dark",
     );
+  }
+  if (patch.busySendMode !== undefined) {
+    next.busySendMode =
+      patch.busySendMode === "send_now" ? "send_now" : "queue";
   }
   fs.writeFileSync(p, JSON.stringify(next, null, 2), "utf8");
   return getDesktopConfigView(home);

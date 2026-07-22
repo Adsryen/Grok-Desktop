@@ -67,6 +67,7 @@ export const enUS: MessageDict = {
   "nav.automations": "Automations",
   "nav.inbox": "Inbox",
   "nav.projects": "Projects",
+  "nav.chats": "Chats",
   "nav.addProject": "Add project",
   "nav.settings": "Settings",
   "nav.openLocation": "Open location ▾",
@@ -318,6 +319,24 @@ export const enUS: MessageDict = {
     "No VERSION.txt (run npm run sync:agent)",
   "settings.agentBinMeta": "agent-bin metadata",
   "settings.diagnostics": "Diagnostics",
+
+  "settings.updateTitle": "App updates",
+  "settings.updateCurrent": "Current version",
+  "settings.updateLatest": "Latest version",
+  "settings.updateCheck": "Check for updates",
+  "settings.updateDownload": "Download update",
+  "settings.updateInstall": "Install and restart",
+  "settings.updateOpenReleases": "Open releases",
+  "settings.updateDevOnly":
+    "In-app updates require a packaged install. Use GitHub Releases or a built installer.",
+  "settings.updateChecking": "Checking…",
+  "settings.updateAvailable": "Update available: {version}",
+  "settings.updateNotAvailable": "You are up to date",
+  "settings.updateDownloading": "Downloading… {percent}%",
+  "settings.updateDownloaded": "Downloaded — install and restart when ready",
+  "settings.updateError": "Update failed: {message}",
+  "settings.updateIdle": "Check GitHub Releases for a newer build.",
+  "settings.updateProgress": "{percent}%",
 
   "settings.memoryTitle": "Memory",
   "settings.memoryDesc":
@@ -978,6 +997,16 @@ export const enUS: MessageDict = {
   "settings.hooksReload": "Rescan",
   "settings.hooksTrusted": "Trusted",
   "settings.hooksUntrusted": "Needs review",
+  "settings.busySend": "Send while busy",
+  "settings.busySendDesc":
+    "What happens when you send again during an active turn (queue vs send_now).",
+  "settings.busySend.queue": "Queue",
+  "settings.busySend.queueSub":
+    "Default: keep the current turn; add the message to the follow-up queue",
+  "settings.busySend.sendNow": "Interrupt and send",
+  "settings.busySend.sendNowSub":
+    "Cancel the current turn, then send immediately (cancelTrigger=send_now)",
+  "chat.sendNow": "Interrupted current turn and sent",
   "settings.idleDetach": "Idle detach Agent",
   "settings.idleDetachDesc":
     "Mode B: detach idle agent processes after this delay (0=off).",
@@ -1176,7 +1205,8 @@ export const enUS: MessageDict = {
   "archive.label": "Archive",
   "archive.empty": "No archived sessions",
   "archive.archived": "Moved to archive",
-  "archive.restored": "Restored to project list",
+  "archive.restored": "Restored to list",
+  "chats.empty": "No chats yet",
   "archive.fail": "Archive failed",
   "archive.restoreFail": "Restore failed",
   "archive.deleted": "Session deleted",

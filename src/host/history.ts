@@ -319,23 +319,39 @@ export function extractText(content: unknown): string {
   return "";
 }
 
+/** 去掉 `<system-reminder>…</system-reminder>`（含未闭合的尾段） */
+export function stripSystemReminders(text: string): string {
+  return text
+    .replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/gi, "")
+    .replace(/<system-reminder\b[^>]*>[\s\S]*$/gi, "")
+    .trim();
+}
+
 function isNoiseUserText(text: string): boolean {
   const t = text.trim();
   if (!t) return true;
-  if (t.startsWith("<system-reminder>")) return true;
-  if (t.startsWith("<user_info>")) return true;
-  if (t.includes("The following skills are available")) return true;
-  if (t.includes("MCP server connected:")) return true;
-  if (t.includes("Follow these instructions exactly")) return true;
-  if (t.length > 4000 && !t.includes("<user_query>")) return true;
+  // 纯 system-reminder / 仅含 reminder 无用户正文 → 噪声（CLI 合成 interrupt 等）
+  const stripped = stripSystemReminders(t);
+  if (!stripped) return true;
+  if (stripped.startsWith("<user_info>") || t.startsWith("<user_info>")) return true;
+  if (stripped.includes("The following skills are available")) return true;
+  if (stripped.includes("MCP server connected:")) return true;
+  if (stripped.includes("Follow these instructions exactly")) return true;
+  if (stripped.length > 4000 && !stripped.includes("<user_query>") && !t.includes("<user_query>")) {
+    return true;
+  }
   return false;
 }
 
-/** Prefer user_query body when present; strip wrapper tags for display. */
+/**
+ * Prefer user_query body when present; strip wrapper tags + system-reminder
+ * for display. 兼容旧 Desktop 把 focus reminder 拼进用户正文后的历史。
+ */
 export function cleanUserText(text: string): string {
   const m = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/i.exec(text);
-  if (m) return m[1].trim();
-  return text
+  let body = m ? m[1] : text;
+  body = stripSystemReminders(body);
+  return body
     .replace(/<\/?user_query>/gi, "")
     .replace(/<\/?user_info>[\s\S]*$/i, "")
     .trim();

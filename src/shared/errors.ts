@@ -12,7 +12,9 @@ export type HostErrorCode =
   | "NOT_ATTACHED"
   | "BINARY_NOT_FOUND"
   | "TIMEOUT"
-  | "INVALID_ARGUMENT";
+  | "INVALID_ARGUMENT"
+  /** User / host cancelled an in-flight ACP request (e.g. session/prompt) */
+  | "CANCELLED";
 
 export class HostError extends Error {
   readonly code: HostErrorCode;
