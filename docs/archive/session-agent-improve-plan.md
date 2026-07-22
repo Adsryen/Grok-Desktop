@@ -1,14 +1,19 @@
 # 会话与 Agent 指挥面完整开发计划
 
+> **【已归档 · 历史文档】**  
+> 原路径 `docs/session-agent-improve-plan.md`。2026-07-21 标「实现完成」后迁入 `docs/archive/`。  
+> **现行对照请用**：[能力矩阵](../cli-desktop-capability-matrix.md) · [cancel/回合对齐计划](../cli-desktop-align-plan.md) · [架构与协议](../架构与协议.md)。  
+> 勿再把本文当未完成 backlog。
+
 | 字段 | 值 |
 |------|-----|
-| 状态 | 实现完成（`feat/session-agent-improve`，2026-07-21） |
-| 分支 | `feat/session-agent-improve` |
+| 状态 | **已归档**（原：实现完成 · `feat/session-agent-improve` · 2026-07-21） |
+| 分支 | `feat/session-agent-improve`（历史） |
 | 日期 | 2026-07-21 |
 | 能力语义源 | **Grok CLI**（`tmp/grok-build-main` pager + shell） |
 | UI 交互参考 | **Codex Desktop** webview asar（仅桌面交互，非 Codex CLI） |
 | 协议实现 | Grok ACP / Desktop Host 现有代码 |
-| 配套 | [能力矩阵](./cli-desktop-capability-matrix.md) · [架构与协议](./架构与协议.md) |
+| 配套（现行） | [能力矩阵](../cli-desktop-capability-matrix.md) · [架构与协议](../架构与协议.md) · [align-plan](../cli-desktop-align-plan.md) |
 
 ---
 
